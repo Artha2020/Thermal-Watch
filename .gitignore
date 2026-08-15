@@ -1,0 +1,81 @@
+# Python bytecode, caches, test caches, and local environments
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.venv/
+venv/
+env/
+
+# Thermal Watch production telemetry, history, active state, and user records
+/thermal_watch_telemetry.db
+/thermal_watch_telemetry.jsonl
+/thermal_watch_reports.db
+/thermal_watch_incidents.jsonl
+/thermal_watch_active_incidents.json
+/thermal_watch_sessions.jsonl
+/thermal_watch_active_sessions.json
+/thermal_watch_experiments.jsonl
+/thermal_watch_events.log
+
+# SQLite runtime sidecars and journals
+*.db-wal
+*.db-shm
+*.db-journal
+
+# Bridge runtime snapshots/status (normally stored under ProgramData)
+/sensors.json
+/sensors.tmp
+/bridge_status.json
+/bridge_status.tmp
+/bridge_errors.log
+
+# LibreHardwareMonitor machine-specific state and debug symbols
+/LibreHardwareMonitor/LibreHardwareMonitor.config
+*.pdb
+
+# Verification/test sandboxes and scratch outputs
+/thermal_watch_verify_*/
+/tools/thermal_watch_verify_*/
+/test_scratch/
+/scratch/
+/quoting_test.csv
+/filtered_cpu_only.csv
+/filtered_export.csv
+/filtered_export.json
+/selected.csv
+/selected.json
+/should_not_exist.csv
+/does_not_exist.jsonl
+
+# User exports, traces, profiles, and local diagnostics
+/exports/
+/export/
+/traces/
+/profiles/
+*.mmp
+*.etl
+*.prof
+*.trace
+
+# PyInstaller build and distribution artifacts
+/build/
+/dist/
+
+# Temporary files, editor backups, and packaged archives
+/tmp/
+/temp/
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+*.zip
+.DS_Store
+Thumbs.db
+*.thumbnail
