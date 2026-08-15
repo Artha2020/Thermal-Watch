@@ -1,8 +1,19 @@
 # Thermal Watch
 
-Thermal Watch is an evidence-based Windows hardware monitor built to answer more than “what is the temperature right now?” It combines live sensor data with persistent telemetry, thermal incidents, workload attribution, sessions, timelines, reports, and trend analysis so that past thermal behavior can be examined without presenting guesses as measurements.
+> **Windows hardware monitoring that remembers what happened.**
 
-This repository represents the v1.0 release developed and validated around its current target PC. Sensor availability and labeling are hardware-, firmware-, driver-, and LibreHardwareMonitor-dependent; v1.0 should not be read as a claim of universal hardware compatibility.
+[![Latest release](https://img.shields.io/github/v/release/Artha2020/Thermal-Watch?display_name=tag&sort=semver)](https://github.com/Artha2020/Thermal-Watch/releases/latest)
+![Windows](https://img.shields.io/badge/platform-Windows-0078D4?logo=windows)
+![Python](https://img.shields.io/badge/Python-3.14%20validated-3776AB?logo=python&logoColor=white)
+[![Downloads](https://img.shields.io/github/downloads/Artha2020/Thermal-Watch/total)](https://github.com/Artha2020/Thermal-Watch/releases)
+
+**Live thermals • Incident history • Workload attribution • Trends • Reports • Evidence-based diagnostics**
+
+## [Download Thermal Watch v1.0.1 for Windows](https://github.com/Artha2020/Thermal-Watch/releases/tag/v1.0.1)
+
+Thermal Watch combines live sensor data with persistent telemetry, incidents, workload sessions, timelines, reports, and trend analysis. It is designed to examine recorded thermal behavior without presenting guesses as measurements.
+
+Version 1.0.1 was developed and validated around the project’s current target PC. Sensor availability and labeling depend on hardware, firmware, drivers, privileges, vendor tools, and LibreHardwareMonitor support; this release does not claim universal hardware compatibility.
 
 ## Overview
 
@@ -65,16 +76,25 @@ Answers are assembled from telemetry, incidents, sessions, reports, and timeline
 
 ## Screenshots
 
-No screenshots are committed yet. Useful v1.0 captures would be:
+### Main dashboard
 
-1. **Main dashboard** — populated CPU/GPU cards, live chart, event log, and lower sensor panels.
-2. **Incident History** — filters, summary tiles, incident table, and a selected incident detail panel.
-3. **Timeline** — a window containing at least one workload session, incident, and monitoring gap.
-4. **Application Analytics or Trend Intelligence** — a real workload with enough retained evidence to show meaningful analysis.
-5. **Sensor History** — a temperature sensor with min/max history and comparison controls.
-6. **Reports and Ask Thermal Watch** — one completed report and one evidence-backed answer with its coverage statement visible.
+Live CPU, GPU, memory, cooling, voltage, storage, motherboard, and RAM telemetry from the target system.
 
-When added, screenshots should use real Thermal Watch windows with private process names or hardware identifiers reviewed before publication. Do not substitute mockups for application screenshots.
+![Thermal Watch main dashboard showing live hardware telemetry](docs/screenshots/main-dashboard.png)
+
+### Incident History
+
+Recorded thermal incidents with severity, peak, duration, workload context, filtering, and per-incident evidence.
+
+![Thermal Watch Incident History](docs/screenshots/incident-history.png)
+
+### Ask Thermal Watch
+
+Deterministic analysis of recorded evidence, including explicit monitoring gaps and non-causal workload language.
+
+![Ask Thermal Watch answering a thermal-history question](docs/screenshots/ask-thermal-watch.png)
+
+See [`docs/screenshots/README.md`](docs/screenshots/README.md) for capture and privacy requirements. These are real windows from the current public build, not design mockups.
 
 ## How Thermal Watch Thinks About Evidence
 
