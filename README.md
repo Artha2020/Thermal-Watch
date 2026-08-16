@@ -1,6 +1,8 @@
 # Thermal Watch
 
 > **Windows hardware monitoring that remembers what happened.**
+>
+> **Thermal Watch gives your AI trustworthy eyes into your PC.**
 
 [![Latest release](https://img.shields.io/github/v/release/Artha2020/Thermal-Watch?display_name=tag&sort=semver)](https://github.com/Artha2020/Thermal-Watch/releases/latest)
 ![Windows](https://img.shields.io/badge/platform-Windows-0078D4?logo=windows)
@@ -14,6 +16,56 @@
 Thermal Watch combines live sensor data with persistent telemetry, incidents, workload sessions, timelines, reports, and trend analysis. It is designed to examine recorded thermal behavior without presenting guesses as measurements.
 
 Version 1.0.1 was developed and validated around the project’s current target PC. Sensor availability and labeling depend on hardware, firmware, drivers, privileges, vendor tools, and LibreHardwareMonitor support; this release does not claim universal hardware compatibility.
+
+Thermal Watch collects and preserves deterministic hardware evidence. An AI assistant can use exported evidence to help diagnose and explain a machine, while Thermal Watch remains the authority for what was actually measured. Thermal Watch itself is not an LLM and does not bundle an AI model.
+
+### Available now in v1.0.1
+
+- Deterministic live hardware monitoring and persistent telemetry
+- Thermal incidents, workload sessions, history, timelines, analytics, trends, and reports
+- Evidence coverage and explicit monitoring-gap handling
+- Ask Thermal Watch, a local deterministic query interface over recorded evidence
+
+### Planned for v1.1
+
+- Self-service AI-assisted hardware setup using a sanitized diagnostic package and provider-neutral compatibility profiles
+- Strict local validation and explicit user approval before any profile is activated
+- A structured, read-only evidence contract for future AI and tool integrations
+- Network Intelligence developed as a separate deterministic evidence track
+
+These v1.1 capabilities are roadmap work, not features in the current v1.0.1 release. The user's own Nox, ChatGPT, Claude, Gemini, Ollama, LM Studio, or another assistant may participate through the same portable data contract; none is a dependency. The design requires no Thermal Watch account, compatibility cloud, diagnostic upload, central AI service, or automatic profile download.
+
+```text
+                    USER'S PC
+                        |
+                        v
+                 THERMAL WATCH
+                        |
+                  HardwareProbe
+                        |
+                        v
+       Sanitized diagnostic + instructions + schema
+                        |
+                        v
+                 USER'S OWN AI
+      Nox / ChatGPT / Claude / Ollama / etc.
+                        |
+                        v
+          Candidate compatibility profile
+                        |
+                        v
+       Thermal Watch validation -> user approval
+                        |
+                        v
+             CompatibilityResolver
+```
+
+Planning documents:
+
+- [AI-assisted setup](docs/AI_SETUP.md)
+- [AI compatibility protocol](docs/AI_COMPATIBILITY_PROTOCOL.md)
+- [Future read-only AI tool interface](docs/AI_TOOL_INTERFACE.md)
+- [v1.1 roadmap](docs/ROADMAP.md)
 
 ## Overview
 
@@ -207,7 +259,7 @@ Additional tools cover telemetry/query benchmarks, monitoring overhead, session 
 - Retention limits long-horizon comparisons; old telemetry, incidents, and sessions are pruned.
 - Ask Thermal Watch supports a defined deterministic question set rather than open-ended natural-language reasoning.
 - Thresholds are monitoring classifications, not replacements for vendor thermal limits, firmware protections, or professional hardware diagnosis.
-- The repository currently has no committed real application screenshots.
+- Hardware coverage shown in the committed screenshots reflects the validated target PC and is not a promise of identical sensor coverage on other systems.
 
 ## License and third-party components
 

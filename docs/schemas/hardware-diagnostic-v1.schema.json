@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Artha2020/Thermal-Watch/blob/main/docs/schemas/hardware-diagnostic-v1.schema.json",
+  "title": "Thermal Watch proposed hardware diagnostic v1",
+  "description": "Draft schema for the planned Thermal Watch v1.1 self-service sanitized hardware diagnostic. It is not implemented in v1.0.1.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["diagnostic_schema_version", "generated_by", "privacy", "system", "providers", "hardware_tree", "field_resolution", "ai_instruction"],
+  "properties": {
+    "diagnostic_schema_version": { "const": 1 },
+    "generated_by": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["application", "application_version"],
+      "properties": {
+        "application": { "const": "Thermal Watch" },
+        "application_version": { "type": "string", "minLength": 1, "maxLength": 32 }
+      }
+    },
+    "privacy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contains_identity", "contains_credentials", "contains_telemetry_history", "contains_process_history", "contains_serial_numbers"],
+      "properties": {
+        "contains_identity": { "const": false },
+        "contains_credentials": { "const": false },
+        "contains_telemetry_history": { "const": false },
+        "contains_process_history": { "const": false },
+        "contains_serial_numbers": { "const": false }
+      }
+    },
+    "system": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["windows_version", "architecture", "cpu_model", "gpu_models", "motherboard"],
+      "properties": {
+        "windows_version": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "architecture": { "enum": ["x64", "arm64", "x86", "unknown"] },
+        "cpu_model": { "type": ["string", "null"], "maxLength": 256 },
+        "gpu_models": {
+          "type": "array",
+          "maxItems": 16,
+          "items": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "uniqueItems": true
+        },
+        "motherboard": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["vendor", "model"],
+          "properties": {
+            "vendor": { "type": ["string", "null"], "maxLength": 128 },
+            "model": { "type": ["string", "null"], "maxLength": 128 }
+          }
+        }
+      }
+    },
+    "providers": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["windows", "librehardwaremonitor", "nvidia-smi"],
+      "properties": {
+        "windows": { "$ref": "#/$defs/providerStatus" },
+        "librehardwaremonitor": { "$ref": "#/$defs/providerStatus" },
+        "nvidia-smi": { "$ref": "#/$defs/providerStatus" }
+      }
+    },
+    "hardware_tree": {
+      "type": "array",
+      "maxItems": 256,
+      "items": { "$ref": "#/$defs/hardwareNode" }
+    },
+    "field_resolution": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cpu_temp": { "$ref": "#/$defs/fieldResolution" },
+        "cpu_power": { "$ref": "#/$defs/fieldResolution" },
+        "gpu_core_temp": { "$ref": "#/$defs/fieldResolution" },
+        "gpu_hotspot_temp": { "$ref": "#/$defs/fieldResolution" },
+        "gpu_memory_temp": { "$ref": "#/$defs/fieldResolution" },
+        "gpu_load": { "$ref": "#/$defs/fieldResolution" },
+        "gpu_power": { "$ref": "#/$defs/fieldResolution" },
+        "gpu_fan": { "$ref": "#/$defs/fieldResolution" }
+      }
+    },
+    "ai_instruction": { "type": "string", "minLength": 1, "maxLength": 4096 }
+  },
+  "$defs": {
+    "providerStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["available", "state", "reason"],
+      "properties": {
+        "available": { "type": "boolean" },
+        "state": { "enum": ["available", "unavailable", "initializing", "stale", "error"] },
+        "reason": { "type": ["string", "null"], "maxLength": 512 },
+        "snapshot_age_seconds": { "type": ["number", "null"], "minimum": 0 }
+      }
+    },
+    "hardwareNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "hardware_type", "name", "identifier", "sensors"],
+      "properties": {
+        "provider": { "enum": ["windows", "librehardwaremonitor", "nvidia-smi"] },
+        "hardware_type": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "identifier": { "type": ["string", "null"], "maxLength": 512 },
+        "sensors": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": { "$ref": "#/$defs/sensor" }
+        }
+      }
+    },
+    "sensor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "identifier", "sensor_type"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "identifier": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "sensor_type": { "enum": ["Temperature", "Fan", "Power", "Clock", "Voltage", "Control", "Load"] }
+      }
+    },
+    "fieldResolution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["resolved", "reason"],
+      "properties": {
+        "resolved": { "type": "boolean" },
+        "reason": { "type": ["string", "null"], "maxLength": 256 },
+        "provider": { "enum": ["windows", "librehardwaremonitor", "nvidia-smi"] },
+        "sensor_identifier": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "sensor_type": { "enum": ["Temperature", "Fan", "Power", "Clock", "Voltage", "Control", "Load"] }
+      }
+    }
+  }
+}

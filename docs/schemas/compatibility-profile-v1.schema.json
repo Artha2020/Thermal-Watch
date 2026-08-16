@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Artha2020/Thermal-Watch/blob/main/docs/schemas/compatibility-profile-v1.schema.json",
+  "title": "Thermal Watch proposed compatibility profile v1",
+  "description": "Draft schema for untrusted candidate profiles in the planned Thermal Watch v1.1 self-service hardware adaptation layer. It is not implemented in v1.0.1.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "profile_name", "hardware_match", "mappings", "notes"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "profile_name": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "hardware_match": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cpu_model", "gpu_models", "motherboard_vendor", "motherboard_model"],
+      "properties": {
+        "cpu_model": { "type": ["string", "null"], "maxLength": 256 },
+        "gpu_models": {
+          "type": "array",
+          "maxItems": 16,
+          "items": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "uniqueItems": true
+        },
+        "motherboard_vendor": { "type": ["string", "null"], "maxLength": 128 },
+        "motherboard_model": { "type": ["string", "null"], "maxLength": 128 }
+      }
+    },
+    "mappings": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "cpu_temp": { "$ref": "#/$defs/temperatureMapping" },
+        "cpu_power": { "$ref": "#/$defs/powerMapping" },
+        "gpu_core_temp": { "$ref": "#/$defs/temperatureMapping" },
+        "gpu_hotspot_temp": { "$ref": "#/$defs/temperatureMapping" },
+        "gpu_memory_temp": { "$ref": "#/$defs/temperatureMapping" },
+        "gpu_load": { "$ref": "#/$defs/loadMapping" },
+        "gpu_power": { "$ref": "#/$defs/powerMapping" },
+        "gpu_fan": { "$ref": "#/$defs/fanMapping" }
+      }
+    },
+    "notes": {
+      "type": "array",
+      "maxItems": 32,
+      "items": { "type": "string", "maxLength": 512 }
+    }
+  },
+  "$defs": {
+    "temperatureMapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "sensor_identifier", "sensor_type"],
+      "properties": {
+        "provider": { "enum": ["windows", "librehardwaremonitor", "nvidia-smi"] },
+        "sensor_identifier": { "type": "string", "minLength": 1, "maxLength": 512, "pattern": "^/[^\\r\\n]*$" },
+        "sensor_type": { "const": "Temperature" }
+      }
+    },
+    "powerMapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "sensor_identifier", "sensor_type"],
+      "properties": {
+        "provider": { "enum": ["windows", "librehardwaremonitor", "nvidia-smi"] },
+        "sensor_identifier": { "type": "string", "minLength": 1, "maxLength": 512, "pattern": "^/[^\\r\\n]*$" },
+        "sensor_type": { "const": "Power" }
+      }
+    },
+    "loadMapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "sensor_identifier", "sensor_type"],
+      "properties": {
+        "provider": { "enum": ["windows", "librehardwaremonitor", "nvidia-smi"] },
+        "sensor_identifier": { "type": "string", "minLength": 1, "maxLength": 512, "pattern": "^/[^\\r\\n]*$" },
+        "sensor_type": { "const": "Load" }
+      }
+    },
+    "fanMapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "sensor_identifier", "sensor_type"],
+      "properties": {
+        "provider": { "enum": ["windows", "librehardwaremonitor", "nvidia-smi"] },
+        "sensor_identifier": { "type": "string", "minLength": 1, "maxLength": 512, "pattern": "^/[^\\r\\n]*$" },
+        "sensor_type": { "const": "Fan" }
+      }
+    }
+  }
+}
