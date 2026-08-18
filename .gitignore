@@ -22,6 +22,9 @@ env/
 /thermal_watch_active_sessions.json
 /thermal_watch_experiments.jsonl
 /thermal_watch_events.log
+/thermal_watch_evidence.json
+/thermal_watch_evidence.tmp
+/thermal_watch_ai_config.json
 
 # SQLite runtime sidecars and journals
 *.db-wal
@@ -34,6 +37,8 @@ env/
 /bridge_status.json
 /bridge_status.tmp
 /bridge_errors.log
+/network_processes.json
+/network_processes.tmp
 
 # LibreHardwareMonitor machine-specific state and debug symbols
 /LibreHardwareMonitor/LibreHardwareMonitor.config

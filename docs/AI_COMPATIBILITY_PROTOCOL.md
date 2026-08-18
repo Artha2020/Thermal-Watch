@@ -1,6 +1,6 @@
 # Thermal Watch AI compatibility protocol
 
-Status: **draft protocol for Thermal Watch v1.1**. Thermal Watch v1.0.1 does not yet export diagnostics or import compatibility profiles.
+Status: **draft protocol for a future Thermal Watch version**. Thermal Watch v1.1.0 does not yet export diagnostics or import compatibility profiles. This is unrelated to the read-only AI evidence-query interface, which is implemented in v1.1.0 — see [AI Tool Interface](AI_TOOL_INTERFACE.md).
 
 This portable, self-service protocol is provider-neutral. Thermal Watch does not require or privilege a particular AI assistant. The diagnostic JSON is the authoritative input; the packaged instructions and schema define the task and output contract.
 

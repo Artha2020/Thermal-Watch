@@ -1,8 +1,12 @@
 # Thermal Watch v1.1 roadmap
 
-Status: **planned work**. Items in this document are not claims about the current v1.0.1 release.
+Status: **Track B and the read-only AI/tool interface are implemented and shipped in v1.1.0.
+Track A (hardware self-service setup) remains planned work and is not a feature of the current
+release.**
 
 ## Track A - Hardware Adaptation and AI Setup
+
+**Status: planned, not implemented.**
 
 Planned components:
 
@@ -33,25 +37,40 @@ This is a self-service local handoff design. It has no Thermal Watch compatibili
 
 ## Track B - Network Intelligence
 
-Planned sequence:
+**Status: implemented and shipped in v1.1.0**, including real elevated end-to-end validation
+against genuine external traffic (sustained real-world application traffic, zero ETW buffers
+lost, per-process attribution correctly tracking the dominant receiving process against Windows
+adapter counters, with no application/PID/adapter-specific implementation logic).
 
-1. Network-interface foundation
-2. Live receive/transmit rates
-3. Per-process network attribution
-4. Connection metadata
-5. Network telemetry and history
-6. Network sessions
-7. Network incidents
-8. Network analytics
-9. Baselines and anomalies
-10. Cross-system correlation with thermal and workload evidence
+Delivered sequence:
 
-The initial design explicitly excludes packet-content inspection. Network Intelligence should record bounded connection and transfer metadata, preserve monitoring gaps, and avoid claiming causation from correlation.
+1. Network-interface foundation — done
+2. Live receive/transmit rates — done
+3. Per-process network attribution — done, validated end-to-end with real elevated ETW capture
+4. Connection metadata — done
+5. Network telemetry and history — done
+6. Network sessions — done
+7. Network incidents — done
+8. Network analytics — done
+9. Baselines and anomalies — done
+10. Cross-system correlation with thermal and workload evidence — done
 
-## Future AI/tool integration
+As designed, packet-content inspection is never performed. Network Intelligence records only
+bounded connection and transfer metadata, preserves monitoring gaps explicitly, and never claims
+causation from correlation.
 
-A future read-only evidence interface may expose the operations documented in [AI_TOOL_INTERFACE.md](AI_TOOL_INTERFACE.md). It will follow one rule:
+## AI/tool integration
+
+**Status: implemented and shipped in v1.1.0.** A read-only evidence interface exposes the
+operations documented in [AI_TOOL_INTERFACE.md](AI_TOOL_INTERFACE.md) to an optional, user-
+configured AI provider (Nox, any OpenAI-compatible endpoint, or a custom integration). It follows
+one rule:
 
 > Thermal Watch owns facts. AI owns conversation and explanation.
 
-AI clients will not be permitted to create or rewrite measurements, telemetry, incidents, sessions, reports, or monitoring gaps.
+AI clients are not permitted to create or rewrite measurements, telemetry, incidents, sessions,
+reports, or monitoring gaps — enforced structurally: the evidence interface is read-only end to
+end, and every AI-provider answer is additionally reviewed by a deterministic Grounding Guard
+before display, which corrects or redacts claims that contradict the evidence retrieved that
+turn and strips fabricated evidence-ID citations. AI integration is entirely optional; Thermal
+Watch is fully functional with no provider configured.

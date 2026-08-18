@@ -4,9 +4,13 @@ Thermal Watch itself has no project license at this time. The notices in this
 directory apply only to the identified third-party components distributed with
 the packaged Windows application.
 
-The v1.0.1 Windows package contains unmodified binary releases and runtime
-components from the projects below. Corresponding license texts are in
-`third_party/licenses/` and are installed beside the application.
+The Windows package (v1.0.0 onward, including v1.1.0) contains unmodified
+binary releases and runtime components from the projects below. Corresponding
+license texts are in `third_party/licenses/` and are installed beside the
+application. No component listed here changed between v1.0.0 and v1.1.0 — the
+v1.1 release added Thermal Watch's own AI provider integration (`ai/`), which
+is dependency-free (Python standard library only) and introduces no new
+third-party component requiring a notice here.
 
 ## Hardware-monitoring components
 

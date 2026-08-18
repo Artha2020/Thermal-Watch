@@ -8,6 +8,7 @@ the whole layer stays read-only/on-demand - never the 2s poll."""
 import inspect
 import sys
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -22,7 +23,19 @@ from app import (  # noqa: E402
     FAN_RESPONSE_MIN_DISTINCT_DAYS,
 )
 
+# Live telemetry checks need a current bucket, while historical calendar fixtures need a stable
+# local-noon reference. Local noon leaves ample room for the largest same-day sample window below.
 NOW = time.time()
+CALENDAR_REFERENCE = datetime(2025, 1, 15, 12, 0, 0).timestamp()
+
+
+def same_local_day_timestamps(count, reference_ts=CALENDAR_REFERENCE, interval_seconds=60):
+    """Build a backwards sample window wholly inside reference_ts's local calendar day."""
+    reference_local = datetime.fromtimestamp(reference_ts)
+    anchor = reference_local.replace(hour=12, minute=0, second=0, microsecond=0)
+    timestamps = [(anchor - timedelta(seconds=i * interval_seconds)).timestamp() for i in range(count)]
+    assert all(datetime.fromtimestamp(ts).date() == anchor.date() for ts in timestamps)
+    return timestamps
 
 
 def bucket(start_ts, gpu_util=96.0, gpu_fan_pct=60.0, gpu_hotspot=91.0, gpu_power=318.0,
@@ -47,7 +60,7 @@ def fan_level_buckets(day_offsets, fan_value, load=96.0, temp=91.0, power=318.0,
     kwargs_base = {load_key: load, fan_key: fan_value, temp_key: temp, power_key: power}
     for day in day_offsets:
         for i in range(n_per_day):
-            t = NOW - day * 86400 - i * 60
+            t = CALENDAR_REFERENCE - day * 86400 - i * 60
             out.append(bucket(t, **kwargs_base))
     return out
 
@@ -77,11 +90,23 @@ def main():
     print(f"  PASS: 1 of 2 buckets used (the one missing fan data excluded outright), power carried as context ({entries[0]['power']}W)")
 
     print("\n=== 3. _distinct_days: counts real calendar-day diversity, not sample count ===")
-    same_day = [{"start_timestamp": NOW - i * 60} for i in range(50)]
-    three_days = [{"start_timestamp": NOW - d * 86400} for d in (0, 1, 2)]
+    same_day = [{"start_timestamp": ts} for ts in same_local_day_timestamps(50)]
+    three_days = [{"start_timestamp": CALENDAR_REFERENCE - d * 86400} for d in (0, 1, 2)]
     assert _distinct_days(same_day) == 1
     assert _distinct_days(three_days) == 3
     print("  PASS: 50 samples in one sitting -> 1 distinct day; 3 samples on 3 different days -> 3 distinct days")
+
+    print("\n=== 3b. same-day fixture remains deterministic shortly after local midnight ===")
+    shortly_after_midnight = datetime(2025, 1, 15, 0, 2, 0).timestamp()
+    midnight_fixture = [
+        {"start_timestamp": ts}
+        for ts in same_local_day_timestamps(50, reference_ts=shortly_after_midnight)
+    ]
+    assert _distinct_days(midnight_fixture) == 1
+    assert {datetime.fromtimestamp(e["start_timestamp"]).date() for e in midnight_fixture} == {
+        datetime.fromtimestamp(shortly_after_midnight).date()
+    }
+    print("  PASS: a simulated 00:02 local clock still produces 50 samples on exactly that local date")
 
     print("\n=== 4. compute_fan_cooling_response: no telemetry at all -> None ===")
     with monkeypatch_telemetry([]):

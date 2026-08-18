@@ -1,6 +1,6 @@
 # Thermal Watch AI setup instructions
 
-Status: **planned for Thermal Watch v1.1**. This workflow is not implemented in the current v1.0.1 release.
+Status: **planned for a future Thermal Watch version**. This workflow is not implemented in the current v1.1.0 release. It is unrelated to v1.1.0's read-only AI evidence-query integration (Ask Thermal Watch's AI Analysis mode) — see [AI Tool Interface](AI_TOOL_INTERFACE.md) for that already-implemented feature.
 
 Thermal Watch is designed to remain useful without an AI assistant. Its monitoring, telemetry, incidents, sessions, history, analytics, reports, and current Ask Thermal Watch interface are deterministic application features.
 
@@ -19,7 +19,7 @@ The planned v1.1 workflow lets a user bring a sanitized hardware inventory to an
 7. Thermal Watch validates every provider and sensor mapping against a fresh local hardware snapshot.
 8. Review the proposed provider changes, mappings, and unresolved fields, then explicitly choose **APPLY PROFILE** or **CANCEL**.
 
-The current v1.0.1 interface does not include **CONFIGURE WITH YOUR AI**, hardware-diagnostic export, or **IMPORT AI PROFILE**. Do not expect those controls until an implementation is completed, tested, and released.
+The current v1.1.0 interface does not include **CONFIGURE WITH YOUR AI**, hardware-diagnostic export, or **IMPORT AI PROFILE**. Do not expect those controls until an implementation is completed, tested, and released.
 
 AI setup is optional. **CONTINUE WITH CURRENT SUPPORT** leaves Thermal Watch running with its built-in detection and every provider that is already available.
 

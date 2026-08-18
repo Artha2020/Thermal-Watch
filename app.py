@@ -20,6 +20,13 @@ from datetime import datetime, date, timedelta
 from pathlib import Path
 from tkinter import filedialog, ttk
 
+# Phase 16 - AI Integration Settings. ai/ has zero dependency on app.py (and must stay that way -
+# see ai/ai_settings.py's own docstring on why its DATA_DIR resolution is independent rather than
+# importing data_path() from here); this is the one direction the dependency is allowed to run.
+from ai import ai_settings
+from ai.provider_contract import ProviderContractError, ProviderResponse
+from ai.provider_registry import UniversalAIAdapter
+
 # ---------------------------------------------------------------------------
 # Theme
 # ---------------------------------------------------------------------------
@@ -197,6 +204,11 @@ def sensor_identity(sensor):
 HISTORY_SECONDS = 24 * 3600
 POLL_SECONDS = 2
 MAX_SAMPLES = HISTORY_SECONDS // POLL_SECONDS
+# IP/gateway/Wi-Fi signal refresh cadence, in POLL_SECONDS ticks - 15 ticks = 30s. These change
+# far less often than the 2s live-Mbps rate needs (a lease renewal, not a per-second event), so
+# paying GetAdaptersAddresses' buffer allocation and a WLAN handle open/close every single tick
+# would be pure overhead; see worker()'s net_slow.
+NET_SLOW_REFRESH_TICKS = 15
 
 RANGES = [("15M", 15 * 60), ("1H", 3600), ("6H", 6 * 3600), ("24H", 24 * 3600)]
 
@@ -209,9 +221,12 @@ RANGES = [("15M", 15 * 60), ("1H", 3600), ("6H", 6 * 3600), ("24H", 24 * 3600)]
 #      below and must NOT follow this setting anywhere.
 #   2. THERMAL_WATCH_DATA_DIR lets a process redirect every store elsewhere BEFORE this module is
 #      imported. The verification suite uses exactly that to run wholly inside a temp directory,
-#      which makes it structurally incapable of naming or modifying real history. The environment-
-#      variable indirection here, plus tools/verify_isolation.py's byte-for-byte hash gate over the
-#      whole production directory, protects against fixture or harness mistakes.
+#      which is what makes it structurally incapable of touching real history: a verify script no
+#      longer promises not to delete the production event log - it cannot NAME it. That guarantee
+#      is not theoretical. A verify script's fixture-setup helper unlinked the real
+#      thermal_watch_events.log on 2026-08-12 and destroyed ~166 KB of irreplaceable history; the
+#      environment-variable indirection here, plus tools/verify_isolation.py's byte-for-byte hash
+#      gate over the whole production directory, is the structural fix for that class of accident.
 #
 # The default is unchanged - next to app.py - so a normal launch behaves exactly as it always has.
 # Anything that legitimately needs to REWRITE a store in place (a schema migration, a maintenance
@@ -311,10 +326,14 @@ ACTIVE_INCIDENTS_FLUSH_INTERVAL_MS = 10000  # periodic throttle for non-escalati
 # _bias_for_sensor_key() already use for live alert text, reused here for consistency. Drives
 # get None: no confident per-process disk-I/O attribution source exists (see the drive alert
 # code) - never invented for incidents either.
-INCIDENT_BIAS = {"cpu": "cpu", "gpu_core": "gpu", "gpu_hotspot": "gpu", "gpu_vram": "gpu", "ram": "cpu", "drive": None}
+# "network" (v1.1 Phase 6): no per-process CPU/GPU workload bias makes sense for a connectivity
+# incident (unlike a thermal one, there's no established reason network loss correlates with
+# whichever process happens to be CPU/GPU-heaviest) - None, same as "drive".
+INCIDENT_BIAS = {"cpu": "cpu", "gpu_core": "gpu", "gpu_hotspot": "gpu", "gpu_vram": "gpu", "ram": "cpu",
+                 "drive": None, "network": None}
 COMPONENT_LABELS = {
     "cpu": "CPU Package", "gpu_core": "GPU Core", "gpu_hotspot": "GPU Hotspot",
-    "gpu_vram": "GPU Memory Junction", "ram": "RAM", "drive": "Drive",
+    "gpu_vram": "GPU Memory Junction", "ram": "RAM", "drive": "Drive", "network": "Network Connectivity",
 }
 
 
@@ -379,9 +398,14 @@ SESSION_ZONE_CONTEXT_KEY = {"cpu": "cpu_temp", "gpu_core": "gpu_core_temp",
                            "gpu_hotspot": "gpu_hotspot_temp", "gpu_vram": "gpu_vram_temp"}
 
 # Streaming per-session metric keys - each accumulated as {count, sum, max} only (item 7: no
-# unlimited raw sample list kept just to compute an average).
+# unlimited raw sample list kept just to compute an average). net_down_mbps/net_up_mbps (v1.1
+# Phase 5) are the ACTIVE ADAPTER's whole-machine rate during this session's window - the same
+# "reading observed while this workload was active" semantic cpu_temp/gpu_temp already use, not
+# an attribution claim that this workload caused that traffic (no per-process network data is
+# session-scoped this app - Phase 2's per-process bytes are a separate, live-only view).
 SESSION_METRIC_KEYS = ("cpu_temp", "cpu_util", "cpu_power", "gpu_core_temp", "gpu_hotspot_temp",
-                       "gpu_vram_temp", "gpu_util", "gpu_power", "mem_pct", "proc_cpu_pct", "proc_gpu_pct")
+                       "gpu_vram_temp", "gpu_util", "gpu_power", "mem_pct", "proc_cpu_pct", "proc_gpu_pct",
+                       "net_down_mbps", "net_up_mbps")
 
 
 def _agg_new():
@@ -466,12 +490,15 @@ TELEMETRY_GAP_BUCKETS = 3
 # from real accumulated history instead of the current live moment alone.
 TELEMETRY_SCALAR_KEYS = ("cpu_temp", "cpu_util", "cpu_power", "gpu_core_temp", "gpu_hotspot_temp",
                         "gpu_vram_temp", "gpu_util", "gpu_power", "gpu_vram_used_mb", "mem_pct",
-                        "cpu_fan_rpm", "gpu_fan_pct")
+                        "cpu_fan_rpm", "gpu_fan_pct", "net_down_mbps", "net_up_mbps",
+                        "net_rx_bytes", "net_tx_bytes")
 TELEMETRY_SCALAR_CONTEXT_MAP = {
     "cpu_temp": "cpu_temp", "cpu_util": "cpu_load", "cpu_power": "cpu_power",
     "gpu_core_temp": "gpu_core_temp", "gpu_hotspot_temp": "gpu_hotspot_temp", "gpu_vram_temp": "gpu_vram_temp",
     "gpu_util": "gpu_load", "gpu_power": "gpu_power", "gpu_vram_used_mb": "gpu_vram_used_mb", "mem_pct": "mem_pct",
     "cpu_fan_rpm": "cpu_fan_rpm", "gpu_fan_pct": "gpu_fan_pct",
+    "net_down_mbps": "net_down_mbps", "net_up_mbps": "net_up_mbps",
+    "net_rx_bytes": "net_rx_bytes", "net_tx_bytes": "net_tx_bytes",
 }
 # (display name, unit, is_temperature) - is_temperature gates the incident-overlay component
 # lookup below (only temperature sensors have a matching thermal-incident component) and the
@@ -487,6 +514,20 @@ TELEMETRY_SCALAR_LABELS = {
     # the way LHM exposes "CPU Fan" (see Cross-Sensor Diagnostics' own scope note); tracked here
     # as-is rather than converted/estimated into a fabricated RPM figure.
     "gpu_fan_pct": ("GPU Fan", "%", False),
+    # Unit carries a leading space (unlike every other unit here) because every consumer of
+    # TELEMETRY_SCALAR_LABELS' unit concatenates it directly onto a formatted number
+    # ({value:.0f}{unit}, no space in the template) - correct for "60" + "°C" = "60°C",
+    # but would render "45" + "Mbps" = "45Mbps" with no space at all. v1.1 Phase 8 found this
+    # pre-existing Phase 1 gap while wiring up network idle baselines through SensorHistoryWindow.
+    "net_down_mbps": ("Network Download", " Mbps", False), "net_up_mbps": ("Network Upload", " Mbps", False),
+    # Monotonic counters (bytes since the adapter last came up) - a bucket's "avg" is not
+    # meaningful for these the way it is for a temperature, but min/max ARE: since the counter
+    # only ever increases, a bucket's min is its first observed value and max is its last, which
+    # is exactly "how much had this adapter moved by the end of this minute". Tracked through the
+    # exact same bucket/avg/min/max machinery as every other scalar rather than inventing a
+    # second aggregation scheme just for counters.
+    "net_rx_bytes": ("Network RX (cumulative)", "B", False),
+    "net_tx_bytes": ("Network TX (cumulative)", "B", False),
 }
 # Which existing incident `component` a scalar/per-sensor metric corresponds to, for overlay
 # matching (item 9) - drive/RAM per-sensor entries map via their own component string directly
@@ -935,7 +976,32 @@ def overlapping_sessions(sessions, start_ts, end_ts, workload_key=None):
 # engine (item 12) so it's testable with plain dicts and no Tk/file-dialog involved.
 # ---------------------------------------------------------------------------
 EXPORT_SCHEMA_VERSION = "1.0"
-APP_VERSION = "2.4"  # matches the header's displayed version
+APP_VERSION = "1.1.0"  # single source of truth for the app's release version - the header label
+                        # derives its displayed "vX.Y.Z" from this constant rather than a second
+                        # hardcoded literal, so the two can never silently drift apart again
+
+# ---------------------------------------------------------------------------
+# Evidence API (v1.1 Phase 10) - "Thermal Watch remains the evidence engine; Nox, or any other
+# AI, can query it." File-based, not a network service: Thermal Watch periodically writes a
+# structured snapshot to a known local path (same atomic tmp-then-replace pattern as every other
+# store here), and any process that can read a file - Nox, a script, a human - can consume it.
+# No listening socket, no new attack surface, no dependency on an AI being configured or even
+# running; Thermal Watch writes this whether or not anything ever reads it.
+#
+# Every section is assembled from ALREADY-COMPUTED state or an already-existing read function -
+# no new aggregation logic, no new causal language. This is the same "AI owns explanation,
+# Thermal Watch owns the facts" split the whole v1.1 roadmap is built around: what's written here
+# is observed readings and Thermal Watch's own deterministic, evidence-qualified findings
+# (incidents, sessions, diagnostics with their existing confidence tiers) - never a fabricated
+# summary, never a value invented to fill a gap. A None/missing field in the JSON means exactly
+# what it means everywhere else in this app: not currently known, not zero.
+# ---------------------------------------------------------------------------
+EVIDENCE_SCHEMA_VERSION = "1.0"
+EVIDENCE_SNAPSHOT_PATH = data_path("thermal_watch_evidence.json")
+# Same cadence as the active-incident/session flush timers - live enough to be useful to an AI
+# polling it, not so frequent that a modest JSON write competes with the 2s sensor poll.
+EVIDENCE_SNAPSHOT_INTERVAL_MS = ACTIVE_INCIDENTS_FLUSH_INTERVAL_MS
+EVIDENCE_RECENT_WINDOW_S = 24 * 3600  # "recent" incidents/sessions included verbatim = last 24h
 
 CSV_DIRECT_FIELDS = [
     "incident_id", "start_timestamp", "end_timestamp", "duration_seconds", "duration_exact",
@@ -951,6 +1017,10 @@ CONTEXT_PEAK_TO_CSV = {
     "gpu_hotspot_temp": "peak_gpu_hotspot_temp", "gpu_vram_temp": "peak_gpu_memory_temp",
     "cpu_power": "peak_cpu_power", "gpu_power": "peak_gpu_power",
     "cpu_load": "peak_cpu_load", "gpu_load": "peak_gpu_load", "mem_pct": "peak_memory_usage",
+    # v1.1 Phase 9 - same generic context_peak capture as every key above, just never exported
+    # before. _csv_cell()'s fixed 2-decimal float formatting already gives Mbps real precision -
+    # no unit-conditional formatting needed here the way the display views required.
+    "net_down_mbps": "peak_network_download_mbps", "net_up_mbps": "peak_network_upload_mbps",
 }
 CSV_NESTED_FIELDS = ["top_cpu_processes", "top_gpu_processes", "monitoring_gaps"]
 CSV_COLUMNS = CSV_DIRECT_FIELDS + list(CONTEXT_PEAK_TO_CSV.values()) + CSV_NESTED_FIELDS
@@ -1136,6 +1206,64 @@ def read_sessions_file():
     return out
 
 
+def _next_evidence_id(existing_records, prefix, day_str, legacy_match=None):
+    """1-based, zero-padded rank for a NEW record sharing (prefix, day_str) with whatever is
+    ALREADY persisted, formatted as PREFIX-YYYYMMDD-NNNN (Phase 14 - Evidence IDs). Deliberately
+    requires no new mutable counter state: the id is a pure function of the existing store,
+    recomputed fresh every time a record is closed/finalized, then frozen into that record and
+    never recomputed again (mirrors incident_id/session_id themselves).
+
+    Counts each existing record once: if it already carries its own frozen `evidence_id`, that id
+    is trusted directly (prefix/day match on the string itself); an OLDER record that predates
+    this field has no `evidence_id` yet, so `legacy_match(rec)` decides whether it belongs to the
+    same (prefix, day_str) group by inspecting its other fields (start_timestamp/component) - so
+    pre-Phase-14 history is never silently skipped and can never collide with a new id."""
+    needle = f"{prefix}-{day_str}-"
+    count = 0
+    for rec in existing_records:
+        eid = rec.get("evidence_id")
+        if eid:
+            if eid.startswith(needle):
+                count += 1
+        elif legacy_match is not None and legacy_match(rec):
+            count += 1
+    return f"{prefix}-{day_str}-{count + 1:04d}"
+
+
+def assign_incident_evidence_id(inc):
+    """Freezes `evidence_id` into a completed incident dict, in place, just once, immediately
+    before its first persist - INC for component != 'network', NET for component == 'network'
+    (network incidents are real incidents through the same engine - see _update_network_incident -
+    but keep the existing NET/INC semantic split). Must run AFTER inc['start_timestamp'] and
+    inc['component'] are final and BEFORE _persist_incident() so the rank it computes from
+    read_incidents_file() never counts this record against itself."""
+    prefix = "NET" if inc.get("component") == "network" else "INC"
+    day_str = local_day_str(inc["start_timestamp"])
+
+    def legacy_match(rec):
+        ts = rec.get("start_timestamp")
+        if ts is None:
+            return False
+        return local_day_str(ts) == day_str and (rec.get("component") == "network") == (prefix == "NET")
+
+    inc["evidence_id"] = _next_evidence_id(read_incidents_file(), prefix, day_str, legacy_match)
+    return inc["evidence_id"]
+
+
+def assign_session_evidence_id(completed):
+    """Freezes `evidence_id` (prefix always SES - sessions have no component split) into a
+    completed session dict, in place, just once, immediately before its first persist. Same
+    contract as assign_incident_evidence_id()."""
+    day_str = local_day_str(completed["start_timestamp"])
+
+    def legacy_match(rec):
+        ts = rec.get("start_timestamp")
+        return ts is not None and local_day_str(ts) == day_str
+
+    completed["evidence_id"] = _next_evidence_id(read_sessions_file(), "SES", day_str, legacy_match)
+    return completed["evidence_id"]
+
+
 def _normalize_workload_name(raw):
     """(canonical_key, display_name) for a raw process/workload name string. Normalization is
     deliberately limited to trimming whitespace and case-folding - it never fuzzy-matches or
@@ -1199,6 +1327,17 @@ BASELINE_SESSION_METRICS = [
     ("gpu", "peak_vram_temp", "GPU Memory Junction (session peak)", "°C"),
     ("gpu", "avg_power", "GPU Power (session avg)", "W"),
     ("gpu", "peak_power", "GPU Power (session peak)", "W"),
+    # v1.1 Phase 7 - Network Analytics. Reuses this exact list: adding these four entries is
+    # the whole implementation - compute_workload_baseline()/evaluate_session_anomalies()/the
+    # Analytics detail renderer all already iterate this list generically, so per-workload
+    # network baselines and session-level network anomaly flagging both come from this addition
+    # alone, no new architecture. Same "whole-active-adapter rate" semantic as the session block
+    # itself (see Phase 5) - an observed correlation with this workload's active window, never a
+    # causal usage claim.
+    ("network", "avg_down_mbps", "Download (session avg)", " Mbps"),
+    ("network", "peak_down_mbps", "Download (session peak)", " Mbps"),
+    ("network", "avg_up_mbps", "Upload (session avg)", " Mbps"),
+    ("network", "peak_up_mbps", "Upload (session peak)", " Mbps"),
 ]
 
 
@@ -1286,7 +1425,7 @@ def compute_idle_baseline(idle_buckets, sensor_ref):
 #   point noise on an unusually consistent baseline can never trigger one.
 # ---------------------------------------------------------------------------
 ANOMALY_Z_THRESHOLD = 2.0
-ANOMALY_MIN_ABS_DELTA = {"°C": 3.0, "W": 15.0}
+ANOMALY_MIN_ABS_DELTA = {"°C": 3.0, "W": 15.0, " Mbps": 5.0}
 
 
 def evaluate_anomaly(current_value, baseline_stats, unit):
@@ -1690,7 +1829,11 @@ def compute_session_health_score(session, anomalies=None, diagnostic_findings=No
                            "points": HEALTH_INCIDENT_WEIGHTS[max_sev] * incident_count})
 
     if anomalies:
-        unusual = [v for v in anomalies.values() if v["anomaly"]["unusual"]]
+        # Network anomalies (v1.1 Phase 7) are deliberately excluded from scoring: unusual
+        # bandwidth doesn't indicate anything wrong with the system's thermal/operational health
+        # the way an unusual temperature does. Still shown informationally in VS BASELINE - just
+        # never a health deduction.
+        unusual = [v for k, v in anomalies.items() if v["anomaly"]["unusual"] and not k.startswith("network.")]
         if unusual:
             deductions.append({"reason": f"{len(unusual)} metric(s) deviated notably from this workload's baseline",
                                "points": HEALTH_ANOMALY_POINTS * len(unusual)})
@@ -2432,7 +2575,13 @@ def group_buckets_by_comparable_load_and_fan(buckets, load_ref, fan_ref, temp_re
 
 
 def _distinct_days(entries):
-    return len({int(e["start_timestamp"] // 86400) for e in entries})
+    """Real LOCAL calendar-day diversity - NOT timestamp // 86400 (a UTC epoch-day count), which
+    silently miscounts for anyone not at UTC+0: a run spanning less than an hour can straddle a
+    UTC-midnight boundary while staying entirely within one local day (e.g. every day around
+    5pm Pacific, UTC-7 - confirmed by this exact bug reproducing then, not something guessed at).
+    Matches the same local-calendar-date discipline Scheduled Health Reports already established
+    for exactly this class of "a day is not 86400 seconds" bug."""
+    return len({datetime.fromtimestamp(e["start_timestamp"]).date() for e in entries})
 
 
 def compute_fan_cooling_response(component, since_ts=None, now=None):
@@ -3028,7 +3177,10 @@ def format_experiment_report(report):
 # ---------------------------------------------------------------------------
 TIMELINE_RANGE_SECONDS = {"6h": 6 * 3600, "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400}
 TIMELINE_MIN_GAP_SECONDS = TELEMETRY_GAP_BUCKETS * TELEMETRY_BUCKET_SECONDS  # reused, not a new number
-TIMELINE_LOG_KINDS = ("WARN", "CRIT")
+TIMELINE_LOG_KINDS = ("WARN", "CRIT", "NETWORK")
+# v1.1 Phase 4 - reused as the sentinel for "no observation yet" in App._detect_network_flight_events,
+# distinct from a real observed absence (None = genuinely no active adapter right now).
+_NET_STATE_UNSET = object()
 
 # A wall-clock jump this large between two consecutive live polls is unmonitored time, not
 # scheduling jitter: the process was suspended (S3 sleep/hibernate) or stalled so severely it is
@@ -3156,30 +3308,83 @@ def timeline_experiment_events(experiments, start_ts, end_ts):
            if e.get("change_timestamp") is not None and start_ts <= e["change_timestamp"] <= end_ts]
 
 
+def _gap_spans(buckets, start_ts, end_ts):
+    """Raw (from_ts, to_ts) pairs for unmonitored stretches inside [start_ts, end_ts], derived
+    purely from telemetry bucket boundaries that already exist - every stretch between buckets
+    longer than TIMELINE_MIN_GAP_SECONDS, plus any stretch before the first bucket or after the
+    last. Factored out of timeline_gap_events() (Phase 14 - Evidence IDs) so both the
+    window-scoped display view and the day-scoped evidence-id identity function
+    (coverage_gap_events_for_day) walk buckets with exactly the same rule and can never quietly
+    disagree about where a gap starts or ends."""
+    spans = sorted((b["start_timestamp"], b.get("end_timestamp") or b["start_timestamp"] + TELEMETRY_BUCKET_SECONDS)
+                  for b in buckets if b.get("start_timestamp") is not None)
+    out, cursor = [], start_ts
+    for b_start, b_end in spans:
+        if b_start - cursor >= TIMELINE_MIN_GAP_SECONDS:
+            out.append((cursor, b_start))
+        cursor = max(cursor, b_end)
+    if end_ts - cursor >= TIMELINE_MIN_GAP_SECONDS:
+        out.append((cursor, end_ts))
+    return out
+
+
+def coverage_gap_events_for_day(day, buckets=None):
+    """Every monitoring-gap event whose start falls on local calendar date `day`, each carrying a
+    stable `source_id`/`evidence_id` (COV-YYYYMMDD-NNNN, 1-based, chronological by gap start
+    timestamp) - a PURE function of already-recorded, immutable telemetry bucket boundaries
+    (Phase 14 - Evidence IDs). No new storage: the id is recomputed fresh from persisted telemetry
+    every call (or from a caller-supplied `buckets` list, e.g. a test fixture) and is always
+    scoped to that day's own [local midnight, next local midnight) bounds, regardless of whatever
+    window a caller happens to be displaying - so the same underlying gap gets the same id whether
+    it is looked up via 'today', 'this week', or a direct per-day query."""
+    day_start = local_midnight_ts(day)
+    day_end = local_midnight_ts(day + timedelta(days=1))
+    if buckets is None:
+        buckets = read_telemetry_file(since_ts=day_start)
+    buckets = [b for b in buckets
+              if b.get("start_timestamp") is not None and day_start <= b["start_timestamp"] < day_end]
+    day_str = day.strftime("%Y%m%d")
+    out = []
+    for idx, (from_ts, to_ts) in enumerate(_gap_spans(buckets, day_start, day_end), start=1):
+        out.append(_timeline_event(
+            from_ts, "gap", "Monitoring gap — nothing was recorded",
+            [f"Duration: {fmt_timeline_span(to_ts - from_ts)}",
+             "No telemetry exists for this period. Thermal Watch makes no claim about what the "
+             "hardware was doing here."],
+            end_timestamp=to_ts, severity="GAP", source_id=f"COV-{day_str}-{idx:04d}"))
+    return out
+
+
 def timeline_gap_events(buckets, start_ts, end_ts):
     """Runs of UNMONITORED time inside the window - the entries that only exist because this is a
     timeline. Derived by walking the telemetry buckets that DO exist and emitting an event for
     every stretch between them longer than TIMELINE_MIN_GAP_SECONDS (plus any stretch before the
     first bucket or after the last). A leading gap covering most of the window is the correct,
     honest answer on a machine that simply wasn't running Thermal Watch then - never suppressed for
-    looking dramatic."""
-    spans = sorted((b["start_timestamp"], b.get("end_timestamp") or b["start_timestamp"] + TELEMETRY_BUCKET_SECONDS)
-                  for b in buckets if b.get("start_timestamp") is not None)
-    out, cursor = [], start_ts
+    looking dramatic.
 
-    def gap(from_ts, to_ts):
-        return _timeline_event(from_ts, "gap", "Monitoring gap — nothing was recorded",
-                              [f"Duration: {fmt_timeline_span(to_ts - from_ts)}",
-                               "No telemetry exists for this period. Thermal Watch makes no claim about "
-                               "what the hardware was doing here."],
-                              end_timestamp=to_ts, severity="GAP")
-
-    for b_start, b_end in spans:
-        if b_start - cursor >= TIMELINE_MIN_GAP_SECONDS:
-            out.append(gap(cursor, b_start))
-        cursor = max(cursor, b_end)
-    if end_ts - cursor >= TIMELINE_MIN_GAP_SECONDS:
-        out.append(gap(cursor, end_ts))
+    Each gap's `source_id` (Phase 14 - Evidence IDs) is looked up from
+    coverage_gap_events_for_day() - the canonical, day-scoped, pure identity function - rather
+    than invented here, so a gap shown in this window-scoped view always carries the exact same
+    evidence_id it would get from a direct day query. A window-scoped gap is matched to its
+    day-scoped canonical span by containment (the day-scoped span, computed over the FULL day
+    regardless of this window, can only be equal to or wider than the window-clipped one)."""
+    day_cache = {}
+    out = []
+    for from_ts, to_ts in _gap_spans(buckets, start_ts, end_ts):
+        day = datetime.fromtimestamp(from_ts).date()
+        if day not in day_cache:
+            day_cache[day] = coverage_gap_events_for_day(day)
+        source_id = None
+        for g in day_cache[day]:
+            if g["timestamp"] <= from_ts and (g["end_timestamp"] or to_ts) >= to_ts:
+                source_id = g["source_id"]
+                break
+        out.append(_timeline_event(from_ts, "gap", "Monitoring gap — nothing was recorded",
+                                   [f"Duration: {fmt_timeline_span(to_ts - from_ts)}",
+                                    "No telemetry exists for this period. Thermal Watch makes no claim "
+                                    "about what the hardware was doing here."],
+                                   end_timestamp=to_ts, severity="GAP", source_id=source_id))
     return out
 
 
@@ -3309,6 +3514,14 @@ def local_midnight_ts(d):
     transition days - which is exactly why boundaries are computed this way rather than by
     multiplying days by 86400."""
     return time.mktime(datetime(d.year, d.month, d.day).timetuple())
+
+
+def local_day_str(ts):
+    """'YYYYMMDD' for the local calendar date containing epoch seconds `ts` - same local-date
+    discipline as local_midnight_ts()/period_bounds() (Phase 14 - Evidence IDs), deliberately NOT
+    `int(ts) // 86400` (that UTC-epoch-day bug class was already found and fixed once, in Cooling/
+    Fan Intelligence's _distinct_days(), and broke at UTC midnight = 5pm Pacific)."""
+    return datetime.fromtimestamp(ts).strftime("%Y%m%d")
 
 
 def add_month(d, months=1):
@@ -4763,14 +4976,709 @@ def nvidia_stats():
     return result
 
 
+# ---------------------------------------------------------------------------
+# Network telemetry (v1.1 Phase 1 - Network Foundation). Same dependency-free, raw-ctypes-
+# against-Windows-DLLs style as nvidia_stats()/memory()/lhm_sensors() above - no psutil, no
+# wmi, no third-party package of any kind.
+#
+# APIs used, and why:
+#   - GetIfTable2 (iphlpapi.dll): per-adapter identity/state/counters. The modern, Vista+,
+#     IPv6-capable replacement for GetIfTable/GetIfEntry - MIB_IF_ROW2 carries 64-bit link
+#     speeds and octet counters plus an explicit MediaConnectState (cable-plugged/associated vs
+#     not) that the legacy MIB_IFROW does not.
+#   - GetBestInterfaceEx (iphlpapi.dll): "which adapter is my real internet connection right
+#     now" - the same technique GetBestRoute2 uses (consulting the live route table) with less
+#     struct surface to get wrong, since it only needs a destination sockaddr, not a NET_LUID
+#     plus a source SOCKADDR_INET binding.
+#   - GetAdaptersAddresses (iphlpapi.dll): unicast IPv4 + default gateway for one adapter.
+#   - GetIpForwardTable2 (iphlpapi.dll): gateway fallback. Measured on real hardware:
+#     IP_ADAPTER_ADDRESSES.FirstGatewayAddress came back NULL for an adapter that unquestionably
+#     has a gateway (ipconfig/Get-NetIPConfiguration/Get-NetRoute all agreed on it) - those
+#     cmdlets read the gateway from the live route table instead, so that is the fallback here
+#     rather than trusting the "textbook" field alone.
+#   - wlanapi.dll: Wi-Fi signal quality. The one piece with a real "not applicable" case on most
+#     machines (wired-only, or WLAN AutoConfig service disabled), so wifi_signal_percent() is
+#     wrapped end-to-end and returns None on any failure - never a fabricated signal reading.
+#
+# Every function below: explicit argtypes/restype on every DLL call (this file's own lesson,
+# paid for once already with the sleep/resume title-bar bug - skipping this can silently
+# misinterpret a 64-bit value), defensive None/[] returns, never a fabricated adapter/value,
+# never an uncaught exception escaping to a caller. READ-ONLY: nothing here sends traffic,
+# opens a raw socket, or changes any adapter/network setting - it only queries counters and
+# state the OS/driver already publish.
+# ---------------------------------------------------------------------------
+_iphlpapi = ctypes.WinDLL("iphlpapi", use_last_error=True)
+try:
+    _wlanapi = ctypes.WinDLL("wlanapi", use_last_error=True)
+except OSError:
+    _wlanapi = None  # not present/loadable on some locked-down or server builds
+_AF_INET = 2
+
+
+class _NET_SOCKADDR_IN(ctypes.Structure):
+    _fields_ = [("sin_family", ctypes.c_short), ("sin_port", ctypes.c_ushort),
+                ("sin_addr", ctypes.c_ubyte * 4), ("sin_zero", ctypes.c_char * 8)]
+
+
+class _NET_SOCKET_ADDRESS(ctypes.Structure):
+    _fields_ = [("lpSockaddr", ctypes.c_void_p), ("iSockaddrLength", ctypes.c_int)]
+
+
+def _net_ipv4_str(sockaddr_ptr):
+    """Best-effort dotted-quad from a SOCKET_ADDRESS.lpSockaddr, or None if it isn't AF_INET or
+    the pointer is null (GetAdaptersAddresses can still hand back non-IPv4 entries even when
+    the query is Family-restricted, in edge cases, so the family is re-checked here)."""
+    if not sockaddr_ptr:
+        return None
+    sa = ctypes.cast(sockaddr_ptr, ctypes.POINTER(_NET_SOCKADDR_IN)).contents
+    if sa.sin_family != _AF_INET:
+        return None
+    return "%d.%d.%d.%d" % tuple(sa.sin_addr)
+
+
+class _NET_GUID(ctypes.Structure):
+    _fields_ = [("Data1", ctypes.c_ulong), ("Data2", ctypes.c_ushort), ("Data3", ctypes.c_ushort),
+               ("Data4", ctypes.c_ubyte * 8)]
+
+
+# -- GetIfTable2 / MIB_IF_ROW2: adapter identity, state, counters --------------------------
+_IF_MAX_STRING_SIZE = 256
+_IF_MAX_PHYS_ADDRESS_LENGTH = 32
+IF_TYPE_ETHERNET_CSMACD = 6
+IF_TYPE_IEEE80211 = 71
+IF_TYPE_SOFTWARE_LOOPBACK = 24
+IF_TYPE_TUNNEL = 131
+_IF_OPER_STATUS_NAMES = {1: "Up", 2: "Down", 3: "Testing", 4: "Unknown", 5: "Dormant",
+                         6: "NotPresent", 7: "LowerLayerDown"}
+_NET_IF_ADMIN_STATUS_UP = 1
+_MEDIA_CONNECT_STATE = {0: None, 1: True, 2: False}  # Unknown / Connected / Disconnected
+_ULONG64_UNKNOWN = 0xFFFFFFFFFFFFFFFF  # sentinel GetIfTable2 uses for "link speed not known"
+
+
+class _IF_OPER_STATUS_FLAGS(ctypes.Structure):
+    """MIB_IF_ROW2.InterfaceAndOperStatusFlags: 8 single-bit BOOLEAN fields packed by MSVC into
+    one byte. Nothing here is read - it exists purely so the ULONG fields that follow
+    (OperStatus etc.) land at the offsets ctypes would otherwise misplace by skipping the
+    compiler's automatic 3-byte pad to the next 4-byte boundary."""
+    _fields_ = [
+        ("HardwareInterface", ctypes.c_ubyte, 1), ("FilterInterface", ctypes.c_ubyte, 1),
+        ("ConnectorPresent", ctypes.c_ubyte, 1), ("NotAuthenticated", ctypes.c_ubyte, 1),
+        ("NotMediaConnected", ctypes.c_ubyte, 1), ("Paused", ctypes.c_ubyte, 1),
+        ("LowPower", ctypes.c_ubyte, 1), ("EndPointInterface", ctypes.c_ubyte, 1),
+    ]
+
+
+class _MIB_IF_ROW2(ctypes.Structure):
+    _fields_ = [
+        ("InterfaceLuid", ctypes.c_uint64), ("InterfaceIndex", ctypes.c_ulong),
+        ("InterfaceGuid", _NET_GUID),
+        ("Alias", ctypes.c_wchar * (_IF_MAX_STRING_SIZE + 1)),
+        ("Description", ctypes.c_wchar * (_IF_MAX_STRING_SIZE + 1)),
+        ("PhysicalAddressLength", ctypes.c_ulong),
+        ("PhysicalAddress", ctypes.c_ubyte * _IF_MAX_PHYS_ADDRESS_LENGTH),
+        ("PermanentPhysicalAddress", ctypes.c_ubyte * _IF_MAX_PHYS_ADDRESS_LENGTH),
+        ("Mtu", ctypes.c_ulong), ("Type", ctypes.c_ulong), ("TunnelType", ctypes.c_uint),
+        ("MediaType", ctypes.c_uint), ("PhysicalMediumType", ctypes.c_uint),
+        ("AccessType", ctypes.c_uint), ("DirectionType", ctypes.c_uint),
+        ("InterfaceAndOperStatusFlags", _IF_OPER_STATUS_FLAGS),
+        ("OperStatus", ctypes.c_uint), ("AdminStatus", ctypes.c_uint),
+        ("MediaConnectState", ctypes.c_uint), ("NetworkGuid", _NET_GUID),
+        ("ConnectionType", ctypes.c_uint),
+        ("TransmitLinkSpeed", ctypes.c_uint64), ("ReceiveLinkSpeed", ctypes.c_uint64),
+        ("InOctets", ctypes.c_uint64), ("InUcastPkts", ctypes.c_uint64),
+        ("InNUcastPkts", ctypes.c_uint64), ("InDiscards", ctypes.c_uint64),
+        ("InErrors", ctypes.c_uint64), ("InUnknownProtos", ctypes.c_uint64),
+        ("InUcastOctets", ctypes.c_uint64), ("InMulticastOctets", ctypes.c_uint64),
+        ("InBroadcastOctets", ctypes.c_uint64), ("OutOctets", ctypes.c_uint64),
+        ("OutUcastPkts", ctypes.c_uint64), ("OutNUcastPkts", ctypes.c_uint64),
+        ("OutDiscards", ctypes.c_uint64), ("OutErrors", ctypes.c_uint64),
+        ("OutUcastOctets", ctypes.c_uint64), ("OutMulticastOctets", ctypes.c_uint64),
+        ("OutBroadcastOctets", ctypes.c_uint64), ("OutQLen", ctypes.c_uint64),
+    ]
+
+
+class _MIB_IF_TABLE2(ctypes.Structure):
+    _fields_ = [("NumEntries", ctypes.c_ulong), ("Table", _MIB_IF_ROW2 * 1)]  # variable-length
+
+
+_iphlpapi.GetIfTable2.argtypes = [ctypes.POINTER(ctypes.POINTER(_MIB_IF_TABLE2))]
+_iphlpapi.GetIfTable2.restype = wintypes.DWORD
+_iphlpapi.FreeMibTable.argtypes = [ctypes.c_void_p]
+_iphlpapi.FreeMibTable.restype = None
+
+
+def network_adapters():
+    """One dict per real network adapter (excludes loopback, tunnel/VPN pseudo-interfaces such
+    as Teredo/ISATAP/6to4, and adapters administratively disabled in Device Manager). [] on any
+    failure - never a fabricated adapter.
+
+    GetIfTable2 also surfaces two categories of non-adapter rows that IF_TYPE alone cannot
+    distinguish from a real NIC (confirmed on real hardware: left un-filtered, these turned 8
+    real adapters into ~55 rows): every NDIS filter driver bound to a real miniport (WFP
+    callout layers, the QoS Packet Scheduler, the Wi-Fi virtual/native filter drivers) gets its
+    own row with the real adapter's description plus a filter-layer suffix - these are bind
+    points in the same driver stack, not separate hardware, and the real adapter is already
+    reported separately without the suffix; and "WAN Miniport (...)" rows are the
+    always-present RAS/PPP framework pseudo-devices Windows creates whether or not any
+    dial-up/VPN/PPPoE connection exists, per Microsoft's own guidance to filter them by name."""
+    table_ptr = ctypes.POINTER(_MIB_IF_TABLE2)()
+    try:
+        if _iphlpapi.GetIfTable2(ctypes.byref(table_ptr)) != 0:
+            return []
+        try:
+            n = table_ptr.contents.NumEntries
+            # MIB_IF_TABLE2.Table is a C99-style flexible array member; the struct above only
+            # declares a 1-element placeholder so ctypes can compute Table's offset. The real
+            # row count comes back in NumEntries, so re-view that same memory as an n-element
+            # array (same address, no copy) rather than trusting the placeholder length.
+            rows = (_MIB_IF_ROW2 * n).from_address(ctypes.addressof(table_ptr.contents.Table))
+            out = []
+            for row in rows:
+                if row.Type in (IF_TYPE_SOFTWARE_LOOPBACK, IF_TYPE_TUNNEL):
+                    continue
+                name = row.Alias or ""
+                lname = name.lower()
+                desc = row.Description or ""
+                ldesc = desc.lower()
+                if any(tag in lname or tag in ldesc for tag in ("teredo", "isatap", "6to4")):
+                    continue
+                if any(tag in ldesc for tag in (
+                        "lightweight filter", "wfp native mac layer", "wfp 802.3 mac layer",
+                        "qos packet scheduler", "virtual wifi filter driver", "native wifi filter driver")):
+                    continue
+                if ldesc.startswith("wan miniport"):
+                    continue
+                if row.AdminStatus != _NET_IF_ADMIN_STATUS_UP:
+                    continue
+                if row.Type == IF_TYPE_ETHERNET_CSMACD:
+                    kind = "Ethernet"
+                elif row.Type == IF_TYPE_IEEE80211:
+                    kind = "Wi-Fi"
+                else:
+                    kind = "Other"
+                rx, tx = row.ReceiveLinkSpeed, row.TransmitLinkSpeed
+                out.append({
+                    "name": name, "description": desc, "type": kind,
+                    "oper_status": _IF_OPER_STATUS_NAMES.get(row.OperStatus, "Unknown"),
+                    "media_connect_state": _MEDIA_CONNECT_STATE.get(row.MediaConnectState),
+                    "receive_link_speed_bps": None if rx == _ULONG64_UNKNOWN else int(rx),
+                    "transmit_link_speed_bps": None if tx == _ULONG64_UNKNOWN else int(tx),
+                    "in_octets": int(row.InOctets), "out_octets": int(row.OutOctets),
+                    "luid": int(row.InterfaceLuid), "index": int(row.InterfaceIndex),
+                })
+            return out
+        finally:
+            _iphlpapi.FreeMibTable(table_ptr)
+    except OSError:
+        return []
+
+
+# -- GetBestInterfaceEx: "which adapter is my real internet connection right now" -----------
+_iphlpapi.GetBestInterfaceEx.argtypes = [ctypes.POINTER(_NET_SOCKADDR_IN), ctypes.POINTER(wintypes.DWORD)]
+_iphlpapi.GetBestInterfaceEx.restype = wintypes.DWORD
+
+
+def default_route_interface_index():
+    """Interface index Windows' routing table would pick right now to reach a public IP (probes
+    8.8.8.8; no packet is actually sent - GetBestInterfaceEx only consults the route table).
+    None on failure (e.g. no route to the internet at all). This is how Thermal Watch decides
+    which of possibly many adapters (Ethernet + Wi-Fi + VPN + virtual) is "the" one to show on
+    the live dashboard - the one actually carrying real internet traffic, not just any adapter
+    that happens to be up."""
+    try:
+        dest = _NET_SOCKADDR_IN()
+        dest.sin_family = _AF_INET
+        dest.sin_port = 0
+        dest.sin_addr[:] = (8, 8, 8, 8)
+        idx = wintypes.DWORD()
+        if _iphlpapi.GetBestInterfaceEx(ctypes.byref(dest), ctypes.byref(idx)) != 0:
+            return None
+        return int(idx.value)
+    except OSError:
+        return None
+
+
+# -- GetAdaptersAddresses: unicast IPv4 + default gateway for one adapter -------------------
+_GAA_FLAG_SKIP_ANYCAST = 0x2
+_GAA_FLAG_SKIP_MULTICAST = 0x4
+_GAA_FLAG_SKIP_DNS_SERVER = 0x8
+_ERROR_BUFFER_OVERFLOW = 111
+_MAX_ADAPTER_ADDRESS_LENGTH = 8
+_MAX_DHCPV6_DUID_LENGTH = 130
+
+
+class _IP_ADAPTER_UNICAST_ADDRESS(ctypes.Structure):
+    pass
+
+
+_IP_ADAPTER_UNICAST_ADDRESS._fields_ = [
+    ("Length", ctypes.c_ulong), ("Flags", ctypes.c_ulong),
+    ("Next", ctypes.POINTER(_IP_ADAPTER_UNICAST_ADDRESS)),
+    ("Address", _NET_SOCKET_ADDRESS),
+    ("PrefixOrigin", ctypes.c_uint), ("SuffixOrigin", ctypes.c_uint), ("DadState", ctypes.c_uint),
+    ("ValidLifetime", ctypes.c_ulong), ("PreferredLifetime", ctypes.c_ulong),
+    ("LeaseLifetime", ctypes.c_ulong), ("OnLinkPrefixLength", ctypes.c_ubyte),
+]
+
+
+class _IP_ADAPTER_GATEWAY_ADDRESS(ctypes.Structure):
+    pass
+
+
+_IP_ADAPTER_GATEWAY_ADDRESS._fields_ = [
+    ("Length", ctypes.c_ulong), ("Reserved", ctypes.c_ulong),
+    ("Next", ctypes.POINTER(_IP_ADAPTER_GATEWAY_ADDRESS)),
+    ("Address", _NET_SOCKET_ADDRESS),
+]
+
+
+class _IP_ADAPTER_ADDRESSES(ctypes.Structure):
+    pass
+
+
+_IP_ADAPTER_ADDRESSES._fields_ = [
+    ("Length", ctypes.c_ulong), ("IfIndex", ctypes.c_ulong),
+    ("Next", ctypes.POINTER(_IP_ADAPTER_ADDRESSES)),
+    ("AdapterName", ctypes.c_char_p),
+    ("FirstUnicastAddress", ctypes.POINTER(_IP_ADAPTER_UNICAST_ADDRESS)),
+    ("FirstAnycastAddress", ctypes.c_void_p), ("FirstMulticastAddress", ctypes.c_void_p),
+    ("FirstDnsServerAddress", ctypes.c_void_p),
+    ("DnsSuffix", ctypes.c_wchar_p), ("Description", ctypes.c_wchar_p), ("FriendlyName", ctypes.c_wchar_p),
+    ("PhysicalAddress", ctypes.c_ubyte * _MAX_ADAPTER_ADDRESS_LENGTH),
+    ("PhysicalAddressLength", ctypes.c_ulong),
+    ("Flags", ctypes.c_ulong), ("Mtu", ctypes.c_ulong), ("IfType", ctypes.c_ulong),
+    ("OperStatus", ctypes.c_uint), ("Ipv6IfIndex", ctypes.c_ulong),
+    ("ZoneIndices", ctypes.c_ulong * 16), ("FirstPrefix", ctypes.c_void_p),
+    ("TransmitLinkSpeed", ctypes.c_uint64), ("ReceiveLinkSpeed", ctypes.c_uint64),
+    ("FirstWinsServerAddress", ctypes.c_void_p),
+    ("FirstGatewayAddress", ctypes.POINTER(_IP_ADAPTER_GATEWAY_ADDRESS)),
+    ("Ipv4Metric", ctypes.c_ulong), ("Ipv6Metric", ctypes.c_ulong), ("Luid", ctypes.c_uint64),
+    ("Dhcpv4Server", _NET_SOCKET_ADDRESS), ("CompartmentId", ctypes.c_ulong),
+    ("NetworkGuid", _NET_GUID), ("ConnectionType", ctypes.c_uint), ("TunnelType", ctypes.c_uint),
+    ("Dhcpv6Server", _NET_SOCKET_ADDRESS),
+    ("Dhcpv6ClientDuid", ctypes.c_ubyte * _MAX_DHCPV6_DUID_LENGTH),
+    ("Dhcpv6ClientDuidLength", ctypes.c_ulong), ("Dhcpv6Iaid", ctypes.c_ulong),
+    ("FirstDnsSuffix", ctypes.c_void_p),
+]
+
+_iphlpapi.GetAdaptersAddresses.argtypes = [
+    wintypes.ULONG, wintypes.ULONG, ctypes.c_void_p,
+    ctypes.POINTER(_IP_ADAPTER_ADDRESSES), ctypes.POINTER(wintypes.ULONG),
+]
+_iphlpapi.GetAdaptersAddresses.restype = wintypes.ULONG
+
+
+class _SOCKADDR_INET(ctypes.Union):
+    """Modeled as a raw-bytes union (rather than nesting full sockaddr_in/sockaddr_in6 variants)
+    since only the AF_INET arm is ever read here; the c_ulong member forces 4-byte alignment to
+    match the real SOCKADDR_INET so later MIB_IPFORWARD_ROW2 fields land at correct offsets."""
+    _fields_ = [("family", ctypes.c_ushort), ("raw", ctypes.c_ubyte * 28), ("_force_align", ctypes.c_ulong)]
+
+
+class _IP_ADDRESS_PREFIX(ctypes.Structure):
+    _fields_ = [("Prefix", _SOCKADDR_INET), ("PrefixLength", ctypes.c_ubyte)]
+
+
+class _MIB_IPFORWARD_ROW2(ctypes.Structure):
+    _fields_ = [
+        ("InterfaceLuid", ctypes.c_uint64), ("InterfaceIndex", ctypes.c_ulong),
+        ("DestinationPrefix", _IP_ADDRESS_PREFIX), ("NextHop", _SOCKADDR_INET),
+        ("SitePrefixLength", ctypes.c_ubyte), ("ValidLifetime", ctypes.c_ulong),
+        ("PreferredLifetime", ctypes.c_ulong), ("Metric", ctypes.c_ulong),
+        ("Protocol", ctypes.c_uint), ("Loopback", ctypes.c_ubyte),
+        ("AutoconfigureAddress", ctypes.c_ubyte), ("Publish", ctypes.c_ubyte),
+        ("Immortal", ctypes.c_ubyte), ("Age", ctypes.c_ulong), ("Origin", ctypes.c_uint),
+    ]
+
+
+class _MIB_IPFORWARD_TABLE2(ctypes.Structure):
+    _fields_ = [("NumEntries", ctypes.c_ulong), ("Table", _MIB_IPFORWARD_ROW2 * 1)]  # variable-length
+
+
+_iphlpapi.GetIpForwardTable2.argtypes = [ctypes.c_ushort, ctypes.POINTER(ctypes.POINTER(_MIB_IPFORWARD_TABLE2))]
+_iphlpapi.GetIpForwardTable2.restype = wintypes.DWORD
+
+
+def _net_default_gateway_via_route_table(index):
+    """Lowest-metric IPv4 next-hop of the 0.0.0.0/0 route(s) owned by this InterfaceIndex, read
+    straight from the live route table - the same source Get-NetRoute/Get-NetIPConfiguration
+    use. Fallback for adapter_ip_info() below: measured on real hardware, GetAdaptersAddresses'
+    own FirstGatewayAddress list can come back empty for an adapter that unquestionably has a
+    gateway. None if this adapter genuinely has no default route."""
+    table_ptr = ctypes.POINTER(_MIB_IPFORWARD_TABLE2)()
+    try:
+        if _iphlpapi.GetIpForwardTable2(_AF_INET, ctypes.byref(table_ptr)) != 0:
+            return None
+        try:
+            n = table_ptr.contents.NumEntries
+            rows = (_MIB_IPFORWARD_ROW2 * n).from_address(ctypes.addressof(table_ptr.contents.Table))
+            best_metric, best_ip = None, None
+            for row in rows:
+                if row.InterfaceIndex != index or row.DestinationPrefix.PrefixLength != 0:
+                    continue
+                if row.NextHop.family != _AF_INET:
+                    continue
+                sa = ctypes.cast(ctypes.byref(row.NextHop), ctypes.POINTER(_NET_SOCKADDR_IN)).contents
+                ip = "%d.%d.%d.%d" % tuple(sa.sin_addr)
+                if ip == "0.0.0.0":
+                    continue
+                if best_metric is None or row.Metric < best_metric:
+                    best_metric, best_ip = row.Metric, ip
+            return best_ip
+        finally:
+            _iphlpapi.FreeMibTable(table_ptr)
+    except OSError:
+        return None
+
+
+def adapter_ip_info(index):
+    """{'ipv4': ..., 'gateway': ...} (either may be None) for the adapter with this IfIndex (the
+    same 'index' network_adapters() returns), or None if the adapter/addresses can't be found."""
+    try:
+        size = ctypes.c_ulong(15000)  # MS-recommended starting size; avoids a second call in the common case
+        buf = None
+        for _ in range(3):
+            buf = (ctypes.c_ubyte * size.value)()
+            ret = _iphlpapi.GetAdaptersAddresses(
+                _AF_INET, _GAA_FLAG_SKIP_ANYCAST | _GAA_FLAG_SKIP_MULTICAST | _GAA_FLAG_SKIP_DNS_SERVER,
+                None, ctypes.cast(buf, ctypes.POINTER(_IP_ADAPTER_ADDRESSES)), ctypes.byref(size))
+            if ret == 0:
+                break
+            if ret == _ERROR_BUFFER_OVERFLOW:
+                continue  # size.value was updated to the required size by the API; retry
+            return None
+        else:
+            return None
+
+        node = ctypes.cast(buf, ctypes.POINTER(_IP_ADAPTER_ADDRESSES))
+        while node:
+            n = node.contents
+            if n.IfIndex == index:
+                ipv4 = _net_ipv4_str(n.FirstUnicastAddress.contents.Address.lpSockaddr) if n.FirstUnicastAddress else None
+                gateway = _net_ipv4_str(n.FirstGatewayAddress.contents.Address.lpSockaddr) if n.FirstGatewayAddress else None
+                if gateway is None:
+                    gateway = _net_default_gateway_via_route_table(index)
+                return {"ipv4": ipv4, "gateway": gateway}
+            node = n.Next
+        return None
+    except OSError:
+        return None
+
+
+# -- wlanapi.dll: Wi-Fi signal quality -------------------------------------------------------
+_WLAN_INTF_OPCODE_CURRENT_CONNECTION = 7
+
+
+class _WLAN_INTERFACE_INFO(ctypes.Structure):
+    _fields_ = [("InterfaceGuid", _NET_GUID), ("strInterfaceDescription", ctypes.c_wchar * 256),
+                ("isState", ctypes.c_uint)]
+
+
+class _WLAN_INTERFACE_INFO_LIST(ctypes.Structure):
+    _fields_ = [("dwNumberOfItems", ctypes.c_ulong), ("dwIndex", ctypes.c_ulong),
+                ("InterfaceInfo", _WLAN_INTERFACE_INFO * 1)]  # variable-length
+
+
+class _DOT11_SSID(ctypes.Structure):
+    _fields_ = [("uSSIDLength", ctypes.c_ulong), ("ucSSID", ctypes.c_ubyte * 32)]
+
+
+class _WLAN_ASSOCIATION_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [
+        ("dot11Ssid", _DOT11_SSID), ("dot11BssType", ctypes.c_uint),
+        ("dot11Bssid", ctypes.c_ubyte * 6), ("dot11PhyType", ctypes.c_uint),
+        ("uDot11PhyIndex", ctypes.c_ulong), ("wlanSignalQuality", ctypes.c_ulong),
+        ("ulRxRate", ctypes.c_ulong), ("ulTxRate", ctypes.c_ulong),
+    ]
+
+
+class _WLAN_SECURITY_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [("bSecurityEnabled", ctypes.c_int), ("bOneXEnabled", ctypes.c_int),
+                ("dot11AuthAlgorithm", ctypes.c_uint), ("dot11CipherAlgorithm", ctypes.c_uint)]
+
+
+class _WLAN_CONNECTION_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [
+        ("isState", ctypes.c_uint), ("wlanConnectionMode", ctypes.c_uint),
+        ("strProfileName", ctypes.c_wchar * 256),
+        ("wlanAssociationAttributes", _WLAN_ASSOCIATION_ATTRIBUTES),
+        ("wlanSecurityAttributes", _WLAN_SECURITY_ATTRIBUTES),
+    ]
+
+
+if _wlanapi is not None:
+    _wlanapi.WlanOpenHandle.argtypes = [wintypes.DWORD, ctypes.c_void_p,
+                                        ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.HANDLE)]
+    _wlanapi.WlanOpenHandle.restype = wintypes.DWORD
+    _wlanapi.WlanCloseHandle.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+    _wlanapi.WlanCloseHandle.restype = wintypes.DWORD
+    _wlanapi.WlanEnumInterfaces.argtypes = [wintypes.HANDLE, ctypes.c_void_p,
+                                            ctypes.POINTER(ctypes.POINTER(_WLAN_INTERFACE_INFO_LIST))]
+    _wlanapi.WlanEnumInterfaces.restype = wintypes.DWORD
+    _wlanapi.WlanQueryInterface.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(_NET_GUID), ctypes.c_uint, ctypes.c_void_p,
+        ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_uint),
+    ]
+    _wlanapi.WlanQueryInterface.restype = wintypes.DWORD
+    _wlanapi.WlanFreeMemory.argtypes = [ctypes.c_void_p]
+    _wlanapi.WlanFreeMemory.restype = None
+
+
+def wifi_signal_percent():
+    """Best-effort Wi-Fi signal quality 0-100, or None on ANY failure: no wlanapi.dll (locked
+    down build), WLAN AutoConfig service not running (WlanOpenHandle fails), no Wi-Fi adapter
+    (WlanEnumInterfaces returns zero items), or nothing currently associated (WlanQueryInterface
+    fails for every interface found). None of these are errors on a wired-only machine - same
+    contract as lhm_sensors()/nvidia_stats(): never invent a value, never raise into the caller."""
+    if _wlanapi is None:
+        return None
+    try:
+        handle = wintypes.HANDLE()
+        negotiated = wintypes.DWORD()
+        if _wlanapi.WlanOpenHandle(2, None, ctypes.byref(negotiated), ctypes.byref(handle)) != 0:
+            return None
+        try:
+            iface_list_ptr = ctypes.POINTER(_WLAN_INTERFACE_INFO_LIST)()
+            if _wlanapi.WlanEnumInterfaces(handle, None, ctypes.byref(iface_list_ptr)) != 0:
+                return None
+            try:
+                n = iface_list_ptr.contents.dwNumberOfItems
+                if n == 0:
+                    return None
+                ifaces = (_WLAN_INTERFACE_INFO * n).from_address(
+                    ctypes.addressof(iface_list_ptr.contents.InterfaceInfo))
+                for iface in ifaces:
+                    data_size = wintypes.DWORD()
+                    data_ptr = ctypes.c_void_p()
+                    opcode_type = ctypes.c_uint()
+                    ret = _wlanapi.WlanQueryInterface(
+                        handle, ctypes.byref(iface.InterfaceGuid), _WLAN_INTF_OPCODE_CURRENT_CONNECTION,
+                        None, ctypes.byref(data_size), ctypes.byref(data_ptr), ctypes.byref(opcode_type))
+                    if ret != 0 or not data_ptr.value:
+                        continue  # this interface isn't connected - try the next one, if any
+                    try:
+                        conn = ctypes.cast(data_ptr, ctypes.POINTER(_WLAN_CONNECTION_ATTRIBUTES)).contents
+                        quality = conn.wlanAssociationAttributes.wlanSignalQuality
+                        if 0 <= quality <= 100:
+                            return int(quality)
+                    finally:
+                        _wlanapi.WlanFreeMemory(data_ptr)
+                return None
+            finally:
+                _wlanapi.WlanFreeMemory(iface_list_ptr)
+        finally:
+            _wlanapi.WlanCloseHandle(handle, None)
+    except OSError:
+        return None
+
+
+def active_network_snapshot(prev):
+    """One tick's worth of network state for the live dashboard/telemetry, plus the updated
+    `prev` state to pass into the next call. Never called with locks/UI access - safe to run on
+    the worker thread exactly like the CPU/GPU polling around it.
+
+    Rate computation mirrors cpu_times()'s own old/now-delta-over-time pattern: down/up Mbps
+    need TWO consecutive samples of the SAME adapter, so the first tick after startup - and any
+    tick where the active adapter has just changed (e.g. Wi-Fi to Ethernet) - correctly reports
+    down_mbps/up_mbps as None rather than dividing by a delta between two unrelated counters."""
+    idx = default_route_interface_index()
+    adapter = None
+    if idx is not None:
+        adapter = next((a for a in network_adapters() if a["index"] == idx), None)
+
+    now_t = time.time()
+    down_mbps = up_mbps = None
+    if adapter is not None and prev.get("index") == idx and prev.get("time") is not None:
+        dt = now_t - prev["time"]
+        if dt > 0:
+            down_mbps = max(0.0, (adapter["in_octets"] - prev["in_octets"]) * 8 / dt / 1e6)
+            up_mbps = max(0.0, (adapter["out_octets"] - prev["out_octets"]) * 8 / dt / 1e6)
+
+    new_prev = ({"index": idx, "in_octets": adapter["in_octets"], "out_octets": adapter["out_octets"], "time": now_t}
+               if adapter is not None else {"index": None, "in_octets": None, "out_octets": None, "time": None})
+
+    return {"adapter": adapter, "down_mbps": down_mbps, "up_mbps": up_mbps}, new_prev
+
+
+NET_TOP_PROCESS_COUNT = 5  # how many rows the dashboard's TOP PROCESSES list shows
+
+
+def process_network_rates(payload, prev):
+    """Turns the bridge's cumulative per-process byte counters (network_processes.json) into
+    live Mbps, the same delta-over-time approach active_network_snapshot() already uses for the
+    whole adapter. A PID absent from `prev` - the first tick after startup, a genuinely new
+    process, or the bridge having just restarted and reset its own accumulator - correctly
+    reports rates as None rather than fabricating a spike against an unrelated baseline. A
+    counter that appears to DECREASE (bridge restart mid-session) also reports None, not a
+    clamped 0.0: unlike a single adapter's rare counter wrap, a per-process table reset is a
+    real gap in the measurement window, and 0.0 would misrepresent it as "confirmed no
+    traffic" rather than "unknown for this interval"."""
+    now_t = time.time()
+    processes = payload.get("processes") or []
+    rates = []
+    new_prev = {}
+    for proc in processes:
+        pid = proc.get("pid")
+        if pid is None:
+            continue
+        bytes_in = proc.get("bytes_in") or 0
+        bytes_out = proc.get("bytes_out") or 0
+        new_prev[pid] = {"bytes_in": bytes_in, "bytes_out": bytes_out, "time": now_t}
+        prior = prev.get(pid)
+        down_mbps = up_mbps = None
+        if prior is not None:
+            dt = now_t - prior["time"]
+            if dt > 0 and bytes_in >= prior["bytes_in"] and bytes_out >= prior["bytes_out"]:
+                down_mbps = (bytes_in - prior["bytes_in"]) * 8 / dt / 1e6
+                up_mbps = (bytes_out - prior["bytes_out"]) * 8 / dt / 1e6
+        rates.append({
+            "pid": pid, "name": proc.get("name"),
+            "bytes_in": bytes_in, "bytes_out": bytes_out,
+            "down_mbps": down_mbps, "up_mbps": up_mbps,
+        })
+    return rates, new_prev
+
+
+# --- v1.1 Phase 3 - Connection Intelligence -------------------------------------------------
+# Who is connected to what, right now: every real TCP connection and bound UDP endpoint, with
+# its owning process. Fully unprivileged (GetExtendedTcpTable/GetExtendedUdpTable, confirmed
+# during Phase 2 research against 27 real TCP + 69 real UDP rows on this machine) - no bridge
+# involvement at all, unlike Phase 2's byte counters. Local/remote IP:port and connection state
+# only - never packet content, matching every other layer's "measuring traffic, not spying" rule.
+_iphlpapi_conn = ctypes.WinDLL("iphlpapi", use_last_error=True)
+_AF_INET = 2
+_TCP_TABLE_OWNER_PID_ALL = 5
+_UDP_TABLE_OWNER_PID = 1
+_ERROR_INSUFFICIENT_BUFFER = 122
+
+_TCP_STATE_NAMES = {
+    1: "CLOSED", 2: "LISTEN", 3: "SYN_SENT", 4: "SYN_RCVD", 5: "ESTABLISHED",
+    6: "FIN_WAIT1", 7: "FIN_WAIT2", 8: "CLOSE_WAIT", 9: "CLOSING", 10: "LAST_ACK",
+    11: "TIME_WAIT", 12: "DELETE_TCB",
+}
+
+
+class _MIB_TCPROW_OWNER_PID(ctypes.Structure):
+    _fields_ = [("dwState", ctypes.c_ulong), ("dwLocalAddr", ctypes.c_ulong),
+                ("dwLocalPort", ctypes.c_ulong), ("dwRemoteAddr", ctypes.c_ulong),
+                ("dwRemotePort", ctypes.c_ulong), ("dwOwningPid", ctypes.c_ulong)]
+
+
+class _MIB_UDPROW_OWNER_PID(ctypes.Structure):
+    _fields_ = [("dwLocalAddr", ctypes.c_ulong), ("dwLocalPort", ctypes.c_ulong), ("dwOwningPid", ctypes.c_ulong)]
+
+
+_GetExtendedTcpTable = _iphlpapi_conn.GetExtendedTcpTable
+_GetExtendedTcpTable.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD), wintypes.BOOL,
+                                 ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+_GetExtendedTcpTable.restype = ctypes.c_ulong
+_GetExtendedUdpTable = _iphlpapi_conn.GetExtendedUdpTable
+_GetExtendedUdpTable.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD), wintypes.BOOL,
+                                 ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+_GetExtendedUdpTable.restype = ctypes.c_ulong
+
+
+def _conn_ip_str(v):
+    return ".".join(str((v >> (8 * i)) & 0xFF) for i in range(4))
+
+
+def _conn_port(v):
+    # Ports come back big-endian (network byte order) inside a little-endian ULONG.
+    return ((v & 0xFF) << 8) | ((v >> 8) & 0xFF)
+
+
+def _raw_tcp_connections():
+    """[{pid, state (raw int), local, remote}, ...] for every real TCP connection - [] on any
+    failure. No byte counts; this table doesn't have them (see Phase 2's research)."""
+    size = wintypes.DWORD(0)
+    ret = _GetExtendedTcpTable(None, ctypes.byref(size), False, _AF_INET, _TCP_TABLE_OWNER_PID_ALL, 0)
+    if ret != _ERROR_INSUFFICIENT_BUFFER:
+        return []
+    buf = ctypes.create_string_buffer(size.value)
+    if _GetExtendedTcpTable(buf, ctypes.byref(size), False, _AF_INET, _TCP_TABLE_OWNER_PID_ALL, 0) != 0:
+        return []
+    num_entries = ctypes.cast(buf, ctypes.POINTER(ctypes.c_ulong))[0]
+    rows = (_MIB_TCPROW_OWNER_PID * num_entries).from_buffer_copy(buf, ctypes.sizeof(ctypes.c_ulong))
+    return [{"pid": r.dwOwningPid, "state": r.dwState,
+             "local": f"{_conn_ip_str(r.dwLocalAddr)}:{_conn_port(r.dwLocalPort)}",
+             "remote": f"{_conn_ip_str(r.dwRemoteAddr)}:{_conn_port(r.dwRemotePort)}"} for r in rows]
+
+
+def _raw_udp_endpoints():
+    """[{pid, local}, ...] for every bound UDP endpoint - [] on any failure. UDP is
+    connectionless, so this table has no remote endpoint or connection state at all."""
+    size = wintypes.DWORD(0)
+    ret = _GetExtendedUdpTable(None, ctypes.byref(size), False, _AF_INET, _UDP_TABLE_OWNER_PID, 0)
+    if ret != _ERROR_INSUFFICIENT_BUFFER:
+        return []
+    buf = ctypes.create_string_buffer(size.value)
+    if _GetExtendedUdpTable(buf, ctypes.byref(size), False, _AF_INET, _UDP_TABLE_OWNER_PID, 0) != 0:
+        return []
+    num_entries = ctypes.cast(buf, ctypes.POINTER(ctypes.c_ulong))[0]
+    rows = (_MIB_UDPROW_OWNER_PID * num_entries).from_buffer_copy(buf, ctypes.sizeof(ctypes.c_ulong))
+    return [{"pid": r.dwOwningPid, "local": f"{_conn_ip_str(r.dwLocalAddr)}:{_conn_port(r.dwLocalPort)}"} for r in rows]
+
+
+def active_connections(name_cache=None):
+    """Every real TCP connection and bound UDP endpoint right now, with its owning process name
+    resolved via the same QueryFullProcessImageNameW path foreground_process()/cpu_top use.
+    `name_cache` (optional, caller-owned {pid: name}) lets the worker thread avoid re-opening a
+    process handle for a PID it already resolved this run - a PID whose process has since exited
+    simply keeps its last-known name (a real historical fact, not a fabrication) rather than
+    reverting to "pid:N"."""
+    cache = name_cache if name_cache is not None else {}
+
+    def resolve(pid):
+        if pid in cache:
+            return cache[pid]
+        name = None
+        if pid:
+            h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if h:
+                try:
+                    name = _process_image_name(h)
+                finally:
+                    ctypes.windll.kernel32.CloseHandle(h)
+        resolved = name or (f"pid:{pid}" if pid else "System")
+        cache[pid] = resolved
+        return resolved
+
+    out = []
+    for row in _raw_tcp_connections():
+        out.append({"protocol": "TCP", "pid": row["pid"], "name": resolve(row["pid"]),
+                    "local": row["local"], "remote": row["remote"],
+                    "state": _TCP_STATE_NAMES.get(row["state"], f"UNKNOWN({row['state']})")})
+    for row in _raw_udp_endpoints():
+        out.append({"protocol": "UDP", "pid": row["pid"], "name": resolve(row["pid"]),
+                    "local": row["local"], "remote": "-", "state": "-"})
+    return out
+
+
 # Sensor types the bridge/direct fallback collect for the full redesign.
 _SENSOR_TYPES = "'Temperature','Fan','Power','Clock','Voltage','Control'"
 
 BRIDGE_DIR = Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData")) / "ThermalWatch"
 BRIDGE_SENSORS_PATH = BRIDGE_DIR / "sensors.json"
 BRIDGE_STATUS_PATH = BRIDGE_DIR / "bridge_status.json"
+BRIDGE_NETPROC_PATH = BRIDGE_DIR / "network_processes.json"
 BRIDGE_FRESH_SECONDS = 10  # unchanged value - was already the freshness cutoff below, now named
 BRIDGE_RECOVERY_MIN_INTERVAL_S = 45  # rate limit: don't re-trigger elevation/UAC more often than this
+
+
+def network_processes():
+    """Per-process cumulative network byte counters from the elevated bridge's ETW capture
+    (v1.1 Phase 2), or an honest empty/inactive result if unavailable. Unlike lhm_sensors(),
+    there is no WMI/direct fallback here - unprivileged code cannot read the Kernel-Network ETW
+    provider at all (confirmed during Phase 2 research), so a bridge that doesn't support this
+    yet, hasn't started capture, or has gone stale is a real capability gap, not just a missed
+    fallback tier."""
+    try:
+        payload = json.loads(BRIDGE_NETPROC_PATH.read_text(encoding="utf-8-sig"))
+        if time.time() - float(payload["timestamp"]) < BRIDGE_FRESH_SECONDS:
+            return payload
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        pass
+    return {"capture_active": False, "capture_error": None, "processes": []}
 
 
 def lhm_sensors():
@@ -4900,6 +5808,20 @@ def fmt_dur(seconds):
     if m:
         return f"{m}m {s:02d}s"
     return f"{s}s"
+
+
+def fmt_net_bytes(n):
+    """Byte count -> human-readable string (binary units, matching Windows' own convention -
+    Task Manager/ipconfig report network totals in GiB/MiB, not decimal GB/MB). None -> 'N/A',
+    never a fabricated 0."""
+    if n is None:
+        return "N/A"
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.2f} {unit}"
+        n /= 1024
+    return f"{n:.2f} TB"
 
 
 # ---------------------------------------------------------------------------
@@ -5274,8 +6196,14 @@ NOT_IDENTIFIED_DISPLAY = "Not identified"
 
 ANALYTICS_COMPONENT_KEYS = ("cpu", "gpu_core", "gpu_hotspot", "gpu_vram", "ram", "drive")
 # context_peak keys worth their own aggregate section (power/load/memory - the temperatures are
-# already covered per-component above via peak_value, not context_peak).
-ANALYTICS_CONTEXT_KEYS = ("cpu_power", "gpu_power", "cpu_load", "gpu_load", "mem_pct")
+# already covered per-component above via peak_value, not context_peak). net_down_mbps/
+# net_up_mbps (v1.1 Phase 9, Cross-System Intelligence) have been captured here automatically
+# since Phase 1 - _incident_touch() already folds every last_context key into context_peak
+# generically, this was simply never surfaced. Purely observational, like every other context
+# key here: "network activity peaked at X Mbps during this workload's thermal incidents" is a
+# fact about what else was happening, never a claim that it caused anything.
+ANALYTICS_CONTEXT_KEYS = ("cpu_power", "gpu_power", "cpu_load", "gpu_load", "mem_pct",
+                          "net_down_mbps", "net_up_mbps")
 
 RANK_MODES = [
     ("Most incidents", "most_incidents"), ("Most Critical incidents", "most_critical"),
@@ -5441,7 +6369,7 @@ class HistoryWindow(tk.Toplevel):
     RANGE_SECONDS = {"All": None, "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400}
     RANGE_ORDER = ("24h", "7d", "30d", "All")
     RANGE_LABELS = {"24h": "24H", "7d": "7D", "30d": "30D", "All": "ALL"}
-    COMPONENTS = ["All", "cpu", "gpu_core", "gpu_hotspot", "gpu_vram", "ram", "drive"]
+    COMPONENTS = ["All", "cpu", "gpu_core", "gpu_hotspot", "gpu_vram", "ram", "drive", "network"]
     SEVERITIES = ["All", "YELLOW", "ORANGE", "RED"]
     # Reuses the app's existing zone-severity colors verbatim (SensorHistoryWindow.MARKER_COLORS,
     # the alert-badge coloring in update_data) rather than the darker orange the design reference
@@ -5462,7 +6390,8 @@ class HistoryWindow(tk.Toplevel):
         ("ANALYSIS", (("Analytics", "open_analytics"), ("Trends", "open_trends"),
                       ("Recommendations", "open_recommendations"), ("Fan Intelligence", "open_fan_intelligence"),
                       ("Maintenance", "open_maintenance"))),
-        ("INTELLIGENCE", (("Reports", "open_reports"), ("Ask", "open_ask"), ("Experiments", "open_experiments"))),
+        ("INTELLIGENCE", (("Reports", "open_reports"), ("Ask", "open_ask"), ("Experiments", "open_experiments"),
+                          ("AI Settings", "open_ai_settings"))),
     )
 
     def __init__(self, master):
@@ -5483,8 +6412,22 @@ class HistoryWindow(tk.Toplevel):
         self.reports_window = None
         self.maintenance_window = None
         self.ask_window = None
+        # ai_settings_window is NOT a plain instance attribute here - see the property just below
+        # __init__. Phase 17 promoted this singleton slot to App itself (self.master.
+        # ai_settings_window) so AskWindow's own "AI Settings" button and this window's menu entry
+        # can never open two AISettingsWindow instances at once. The property keeps this exact
+        # attribute name working unchanged for any existing caller (including
+        # tools/verify_ai_settings.py, which reads/writes hw.ai_settings_window directly).
         self._build()
         self._reload()
+
+    @property
+    def ai_settings_window(self):
+        return self.master.ai_settings_window
+
+    @ai_settings_window.setter
+    def ai_settings_window(self, value):
+        self.master.ai_settings_window = value
 
     def _build(self):
         self.range_var = tk.StringVar(value="All")
@@ -5780,6 +6723,13 @@ class HistoryWindow(tk.Toplevel):
             self.ask_window.focus_force()
             return
         self.ask_window = AskWindow(self.master)
+
+    def open_ai_settings(self):
+        if self.ai_settings_window is not None and self.ai_settings_window.winfo_exists():
+            self.ai_settings_window.lift()
+            self.ai_settings_window.focus_force()
+            return
+        self.ai_settings_window = AISettingsWindow(self.master)
 
     def _reload(self):
         self.all_incidents = read_incidents_file()
@@ -6079,6 +7029,17 @@ class HistoryWindow(tk.Toplevel):
             f"{label}: {ctx[k]:.0f}{unit}" if ctx.get(k) is not None else f"{label}: N/A"
             for k, label, unit in ctx_fields
         )
+        # v1.1 Phase 9 - purely observational context, same as every field above: what network
+        # activity peaked at while this thermal incident was happening, never a claim it
+        # contributed to it. Appended as its own segment (not merged into ctx_fields above) so
+        # every pre-existing field keeps its exact original "label: N/A" behavior untouched -
+        # network is the only one of these that's genuinely new since Phase 1 and can be
+        # legitimately absent (an older incident predating that capture, or a network blackout),
+        # so it's the only one that omits itself instead of showing a placeholder.
+        net_ctx_fields = [("net_down_mbps", "Network down peak", " Mbps"), ("net_up_mbps", "Network up peak", " Mbps")]
+        net_ctx_parts = [f"{label}: {ctx[k]:.1f}{unit}" for k, label, unit in net_ctx_fields if ctx.get(k) is not None]
+        if net_ctx_parts:
+            ctx_line += "   ·   " + "   ·   ".join(net_ctx_parts)
         lines.append("")
         lines.append(ctx_line)
         self.detail_text.config(text="\n".join(lines))
@@ -6313,8 +7274,10 @@ class AnalyticsWindow(tk.Toplevel):
             c = s["context"].get(key)
             if not c:
                 return []
-            return [title, f"  Avg incident peak    {c['avg_peak']:.0f}{unit}",
-                   f"  Highest recorded     {c['max_peak']:.0f}{unit}", ""]
+            # Mbps commonly sits under 1 - see the BASELINE section's own precision note above.
+            prec = 1 if unit == " Mbps" else 0
+            return [title, f"  Avg incident peak    {c['avg_peak']:.{prec}f}{unit}",
+                   f"  Highest recorded     {c['max_peak']:.{prec}f}{unit}", ""]
 
         last = s.get("last_incident_timestamp")
         anomalous = s.get("anomalous_sessions")
@@ -6355,11 +7318,16 @@ class AnalyticsWindow(tk.Toplevel):
         if established or pending:
             lines.append("BASELINE — what's normal for this workload on this machine")
             for label, unit, stat in established:
+                # Mbps commonly sits under 1 for light/idle-ish workloads - 0 decimals would
+                # render as an uninformative "0-0 Mbps" for exactly the sessions where the real
+                # number matters most. Every other unit here (deg C, W) keeps its existing
+                # 0-decimal formatting unchanged.
+                prec = 1 if unit == " Mbps" else 0
                 if stat["stddev"] is not None:
                     lo, hi = stat["mean"] - stat["stddev"], stat["mean"] + stat["stddev"]
-                    lines.append(f"  {label:<36}{lo:.0f}–{hi:.0f}{unit}  (n={stat['count']})")
+                    lines.append(f"  {label:<36}{lo:.{prec}f}–{hi:.{prec}f}{unit}  (n={stat['count']})")
                 else:
-                    lines.append(f"  {label:<36}{stat['mean']:.0f}{unit}  (n={stat['count']})")
+                    lines.append(f"  {label:<36}{stat['mean']:.{prec}f}{unit}  (n={stat['count']})")
             for label, stat in pending:
                 lines.append(f"  {label:<36}not enough data yet ({stat['count']}/{BASELINE_MIN_SESSIONS} sessions)")
             lines.append("")
@@ -6367,7 +7335,9 @@ class AnalyticsWindow(tk.Toplevel):
         for block in (comp_block("cpu", "CPU"), comp_block("gpu_core", "GPU CORE"),
                      comp_block("gpu_hotspot", "GPU HOTSPOT"), comp_block("gpu_vram", "GPU MEMORY"),
                      comp_block("ram", "RAM"), comp_block("drive", "DRIVE"),
-                     ctx_block("cpu_power", "CPU POWER", "W"), ctx_block("gpu_power", "GPU POWER", "W")):
+                     ctx_block("cpu_power", "CPU POWER", "W"), ctx_block("gpu_power", "GPU POWER", "W"),
+                     ctx_block("net_down_mbps", "NETWORK DOWNLOAD (during thermal incidents)", " Mbps"),
+                     ctx_block("net_up_mbps", "NETWORK UPLOAD (during thermal incidents)", " Mbps")):
             lines.extend(block)
         self.detail_text.config(text="\n".join(lines))
 
@@ -6586,6 +7556,25 @@ class SessionsWindow(tk.Toplevel):
                     lines.append(line)
             lines.append("")
 
+        # v1.1 Phase 5 - whole-active-adapter Mbps observed while this session was active (see
+        # the "network" block's own comment in _finalize_session_record for the non-causal
+        # framing). Header only appears when at least one real sample exists, same rule as MEMORY
+        # above - an older session recorded before Phase 5 simply has no "network" key at all.
+        net = s.get("network") or {}
+
+        def net_line(label, value):
+            return f"{label:<24}{value:.1f} Mbps" if value is not None else None
+
+        if net.get("avg_down_mbps") is not None or net.get("peak_down_mbps") is not None:
+            lines.append("NETWORK")
+            for line in (net_line("  Average download:", net.get("avg_down_mbps")),
+                        net_line("  Peak download:", net.get("peak_down_mbps")),
+                        net_line("  Average upload:", net.get("avg_up_mbps")),
+                        net_line("  Peak upload:", net.get("peak_up_mbps"))):
+                if line:
+                    lines.append(line)
+            lines.append("")
+
         lines.append("THERMAL")
         lines.append(f"  Associated incidents:  {s.get('incident_count', 0)}")
         lines.append(f"  Maximum severity:      {s.get('max_incident_severity') or 'N/A'}")
@@ -6622,8 +7611,9 @@ class SessionsWindow(tk.Toplevel):
                     a = v["anomaly"]
                     sign = "+" if a["delta"] >= 0 else ""
                     z_text = f", z={a['z_score']:.1f}" if a["z_score"] is not None else ""
-                    lines.append(f"  ⚠ UNUSUAL: {v['label']}  {v['current']:.0f}{v['unit']} vs baseline "
-                                f"{a['baseline_mean']:.0f}{v['unit']}  ({sign}{a['delta']:.0f}{v['unit']}{z_text})")
+                    prec = 1 if v["unit"] == " Mbps" else 0  # see the BASELINE section's own precision note
+                    lines.append(f"  ⚠ UNUSUAL: {v['label']}  {v['current']:.{prec}f}{v['unit']} vs baseline "
+                                f"{a['baseline_mean']:.{prec}f}{v['unit']}  ({sign}{a['delta']:.{prec}f}{v['unit']}{z_text})")
             else:
                 lines.append("  No metric deviated notably from this workload's established baseline")
 
@@ -7012,6 +8002,71 @@ class ExperimentsWindow(tk.Toplevel):
         self.detail_text.config(text="\n".join(format_experiment_report(report)))
 
 
+class ConnectionsWindow(tk.Toplevel):
+    """ACTIVE CONNECTIONS (v1.1 Phase 3, Connection Intelligence) - opened from the NETWORK
+    panel's connection-count cell. Purely on-demand, same convention as every other analysis
+    window: populated from a live active_connections() call on open and on REFRESH, never tied
+    to the 2s poll (a Treeview holding 150+ live-refreshing rows every 2s would be real,
+    pointless UI churn for a list meant to be read, not watched). Metadata only - owning
+    process, local/remote address:port, protocol, TCP state - never packet content, same rule
+    as every other network layer in this app."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title("Thermal Watch — Active Connections")
+        self.geometry("980x620")
+        self.minsize(760, 420)
+        self.configure(bg=BG)
+        apply_dark_titlebar(self)
+        self._build()
+        self._reload()
+
+    def _build(self):
+        bar = tk.Frame(self, bg=BG); bar.pack(fill="x", padx=16, pady=(14, 8))
+        self.count_label = tk.Label(bar, text="", bg=BG, fg=DIM, font=(MONO, 9))
+        self.count_label.pack(side="left")
+        tk.Button(bar, text="REFRESH", command=self._reload, bg="#181b1f", fg=TEXT, relief="flat",
+                 font=(MONO, 9), padx=10, pady=4, cursor="hand2").pack(side="right")
+
+        style = ttk.Style(self)
+        style.theme_use(style.theme_use())
+        style.configure("Thermal.Treeview", background=PANEL, fieldbackground=PANEL, foreground=TEXT,
+                        rowheight=22, borderwidth=0, font=(MONO, 9),
+                        bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER)
+        style.configure("Thermal.Treeview.Heading", background=BORDER, foreground=MUTED, relief="flat",
+                        font=(MONO, 8))
+        style.map("Thermal.Treeview", background=[("selected", BORDER2)], foreground=[("selected", TEXT)])
+
+        columns = ("process", "pid", "protocol", "local", "remote", "state")
+        headers = {"process": "PROCESS", "pid": "PID", "protocol": "PROTO", "local": "LOCAL",
+                  "remote": "REMOTE", "state": "STATE"}
+        widths = {"process": 190, "pid": 70, "protocol": 60, "local": 190, "remote": 190, "state": 110}
+        self.tree = ttk.Treeview(self, columns=columns, show="headings", style="Thermal.Treeview")
+        for c in columns:
+            self.tree.heading(c, text=headers[c])
+            self.tree.column(c, width=widths[c], anchor="w")
+        self.tree.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+
+        tk.Label(self, text="Connection metadata only (owning process, address:port, TCP state) - "
+                            "never packet content.",
+                bg=BG, fg=DIM, font=(MONO, 9)).pack(anchor="w", padx=16, pady=(0, 12))
+
+    def _reload(self):
+        """The only place this window touches live state: one fresh active_connections() call,
+        independent of the worker thread's own tick (a name_cache of its own, so REFRESH always
+        shows the current owning process even if the worker's cache is mid-resolve)."""
+        connections = active_connections()
+        connections.sort(key=lambda c: (c["name"].lower(), c["protocol"], c["local"]))
+        self.tree.delete(*self.tree.get_children())
+        for c in connections:
+            self.tree.insert("", "end", values=(c["name"], c["pid"], c["protocol"],
+                                                 c["local"], c["remote"], c["state"]))
+        tcp_n = sum(1 for c in connections if c["protocol"] == "TCP")
+        udp_n = sum(1 for c in connections if c["protocol"] == "UDP")
+        self.count_label.config(text=f"{tcp_n} TCP connection(s) · {udp_n} UDP endpoint(s)")
+
+
 class TimelineWindow(tk.Toplevel):
     """UNIFIED FLIGHT RECORDER TIMELINE - opened from History, same pattern as every other analysis
     window. Read-only and on-demand (recomputes on open/REFRESH/range or filter change, never on
@@ -7337,10 +8392,88 @@ class MaintenanceWindow(tk.Toplevel):
         self.text.config(text="\n".join(format_maintenance_outlook(compute_maintenance_outlook())))
 
 
+def _ai_evidence_ids_in(data):
+    """Every `evidence_id` value present anywhere inside one dispatched evidence item's `data`,
+    walked recursively - mirrors ai/grounding_guard.py's own _collect_evidence_ids() but stays
+    local to app.py (the AI module must not import app.py, see ai/ai_settings.py's docstring)."""
+    found = []
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k == "evidence_id" and isinstance(v, str):
+                    found.append(v)
+                walk(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item)
+
+    walk(data)
+    return found
+
+
+def _format_ai_evidence_lines(evidence, grounding):
+    """Bounded, human-readable "Show Evidence" panel content for AI Analysis mode. Deliberately
+    NOT a raw JSON dump: only evidence_id, source/operation, timestamp/window, the specific
+    claimed-vs-evidence value, and coverage/monitoring-gap status are ever shown. No filesystem
+    path, DATA_DIR, database path, or secret/API-key material exists anywhere in a ProviderResponse
+    to begin with, but this stays curated on purpose rather than trusting that structurally."""
+    lines = []
+    claims = list(getattr(grounding, "claims", None) or []) if grounding is not None else []
+    if claims:
+        lines.append("CLAIMS CHECKED AGAINST EVIDENCE:")
+        for claim in claims:
+            header = f"  - [{claim.verdict.upper()}]"
+            if claim.field:
+                header += f" {claim.field}"
+            if claim.evidence_id:
+                header += f"  (evidence_id: {claim.evidence_id})"
+            lines.append(header)
+            if claim.claimed_value is not None or claim.evidence_value is not None:
+                lines.append(f"      claimed={claim.claimed_value!r}  evidence={claim.evidence_value!r}")
+        lines.append("")
+    if evidence:
+        lines.append("EVIDENCE RETRIEVED THIS TURN:")
+        for item in evidence:
+            if not isinstance(item, dict):
+                continue
+            operation = item.get("operation", "?")
+            status = item.get("evidence_status", "?")
+            generated_at = item.get("generated_at")
+            when = "-"
+            if isinstance(generated_at, (int, float)):
+                try:
+                    when = datetime.fromtimestamp(generated_at).strftime("%Y-%m-%d %H:%M:%S")
+                except (OSError, OverflowError, ValueError):
+                    when = "-"
+            row = f"  - {operation}  [{status}]  as of {when}"
+            ids = sorted(set(_ai_evidence_ids_in(item.get("data"))))
+            if ids:
+                row += f"  evidence_id(s): {', '.join(ids)}"
+            coverage = item.get("coverage")
+            if isinstance(coverage, dict) and coverage.get("coverage_pct") is not None:
+                row += f"  coverage: {coverage['coverage_pct']}%"
+            lines.append(row)
+    return lines
+
+
 class AskWindow(tk.Toplevel):
-    """ASK THERMAL WATCH - a question box over the structured stores. Read-only and on-demand; it
-    answers only from records, and says so at the end of every answer. Not a chatbot: there is no
-    model here, and no sentence in an answer exists that was not selected from retrieved evidence."""
+    """ASK THERMAL WATCH - a question box over the structured stores, plus (Phase 17) an optional
+    AI Analysis mode wired to the already-built Phase 11-16 AI stack.
+
+    EVIDENCE mode (default, unchanged): read-only and on-demand; it answers only from records, and
+    says so at the end of every answer. Not a chatbot: there is no model here, and no sentence in
+    an answer exists that was not selected from retrieved evidence.
+
+    AI ANALYSIS mode: a thin UI + async layer around ONE call, `self.app.ai_adapter.ask(question)`
+    (read fresh every request, never cached - so a config change in AISettingsWindow is picked up
+    on the very next submit with no restart). That single call already does provider construction,
+    the bounded evidence tool-call loop, and GroundingGuard review internally
+    (ai/provider_registry.py's UniversalAIAdapter.ask()) - this window only ever renders the
+    `.answer`/`.grounding`/`.evidence` it gets back, never anything from a provider directly.
+    Conversation scope is deliberately ONE-SHOT ONLY: each submission is independent, exactly like
+    Evidence mode; no chat history, no persistence of question/answer text to any Thermal Watch
+    store, nothing surviving past this window's own transient widget state."""
 
     def __init__(self, app):
         super().__init__(app)
@@ -7350,11 +8483,36 @@ class AskWindow(tk.Toplevel):
         self.minsize(780, 540)
         self.configure(bg=BG)
         apply_dark_titlebar(self)
+        self._ai_request_in_flight = False
+        self._ai_evidence_visible = False
+        self._ai_status_text = "Ready"
+        self._ai_last_response = None
         self._build()
         self._show_welcome()
 
     def _build(self):
-        bar = tk.Frame(self, bg=BG); bar.pack(fill="x", padx=16, pady=(14, 6))
+        mode_bar = tk.Frame(self, bg=BG); mode_bar.pack(fill="x", padx=16, pady=(14, 0))
+        tk.Label(mode_bar, text="MODE", bg=BG, fg=DIM, font=(MONO, 8)).pack(side="left", padx=(0, 8))
+        self.evidence_mode_btn = tk.Button(mode_bar, text="EVIDENCE", command=lambda: self._set_mode("evidence"),
+                                           relief="flat", font=(MONO, 9), padx=10, pady=4, cursor="hand2")
+        self.evidence_mode_btn.pack(side="left")
+        self.ai_mode_btn = tk.Button(mode_bar, text="AI ANALYSIS", command=lambda: self._set_mode("ai"),
+                                     relief="flat", font=(MONO, 9), padx=10, pady=4, cursor="hand2")
+        self.ai_mode_btn.pack(side="left", padx=(6, 0))
+
+        self.evidence_frame = tk.Frame(self, bg=BG)
+        self.ai_frame = tk.Frame(self, bg=BG)
+        self._build_evidence_frame()
+        self._build_ai_frame()
+
+        self.mode_var = tk.StringVar(value="evidence")
+        self.evidence_frame.pack(fill="both", expand=True)
+        self._update_mode_buttons()
+
+    # -- EVIDENCE mode: identical widgets/behavior to the pre-Phase-17 window, just parented to
+    # self.evidence_frame instead of self so it can coexist with the new mode toggle. ------------
+    def _build_evidence_frame(self):
+        bar = tk.Frame(self.evidence_frame, bg=BG); bar.pack(fill="x", padx=16, pady=(6, 6))
         tk.Label(bar, text="ASK", bg=BG, fg=DIM, font=(MONO, 8)).pack(side="left")
         self.question_var = tk.StringVar()
         entry = tk.Entry(bar, textvariable=self.question_var, bg=PANEL, fg=TEXT,
@@ -7365,14 +8523,14 @@ class AskWindow(tk.Toplevel):
         tk.Button(bar, text="ASK", command=self._ask, bg="#181b1f", fg=TEXT, relief="flat",
                  font=(MONO, 9), padx=12, pady=4, cursor="hand2").pack(side="left")
 
-        examples = tk.Frame(self, bg=BG); examples.pack(fill="x", padx=16, pady=(0, 8))
+        examples = tk.Frame(self.evidence_frame, bg=BG); examples.pack(fill="x", padx=16, pady=(0, 8))
         tk.Label(examples, text="TRY", bg=BG, fg=DIM, font=(MONO, 8)).pack(side="left", padx=(0, 6))
         for question in ASK_EXAMPLES[:3]:
             tk.Button(examples, text=question, command=lambda q=question: self._ask(q),
                      bg="#181b1f", fg=MUTED, relief="flat", font=(MONO, 8), padx=8, pady=3,
                      cursor="hand2").pack(side="left", padx=(0, 6))
 
-        panel = tk.Frame(self, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
+        panel = tk.Frame(self.evidence_frame, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
         panel.pack(fill="both", expand=True, padx=16, pady=(0, 14))
         scroll = ScrollFrame(panel, bg=PANEL); scroll.pack(fill="both", expand=True, padx=2, pady=2)
         self.answer_text = tk.Label(scroll.inner, text="", bg=PANEL, fg=TEXT, font=(SANS, 10),
@@ -7396,6 +8554,416 @@ class AskWindow(tk.Toplevel):
             return
         answer = answer_question(text)
         self.answer_text.config(text="\n".join([f"Q: {text}", ""] + answer["lines"]))
+
+    # -- mode toggle ---------------------------------------------------------------------------
+    def _set_mode(self, mode):
+        self.mode_var.set(mode)
+        if mode == "evidence":
+            self.ai_frame.pack_forget()
+            self.evidence_frame.pack(fill="both", expand=True)
+        else:
+            self.evidence_frame.pack_forget()
+            self.ai_frame.pack(fill="both", expand=True)
+            self._refresh_ai_availability()
+        self._update_mode_buttons()
+
+    def _update_mode_buttons(self):
+        active_bg, inactive_bg = "#2a2f38", "#181b1f"
+        mode = self.mode_var.get()
+        self.evidence_mode_btn.config(bg=active_bg if mode == "evidence" else inactive_bg, fg=TEXT)
+        self.ai_mode_btn.config(bg=active_bg if mode == "ai" else inactive_bg, fg=TEXT)
+
+    # -- AI ANALYSIS mode ------------------------------------------------------------------------
+    def _build_ai_frame(self):
+        status_bar = tk.Frame(self.ai_frame, bg=BG); status_bar.pack(fill="x", padx=16, pady=(6, 6))
+        self.ai_status_label = tk.Label(status_bar, text="", bg=BG, fg=MUTED, font=(MONO, 9),
+                                        justify="left", anchor="w")
+        self.ai_status_label.pack(side="left", fill="x", expand=True)
+        tk.Button(status_bar, text="AI SETTINGS", command=self._open_ai_settings, bg="#181b1f", fg=TEXT,
+                 relief="flat", font=(MONO, 9), padx=10, pady=4, cursor="hand2").pack(side="right")
+
+        # Shown only when self.app.ai_adapter is None - no network activity is ever attempted in
+        # this state (see _ai_ask()'s guard, which re-checks this fresh before doing anything else).
+        self.ai_unavailable_frame = tk.Frame(self.ai_frame, bg=BG)
+        tk.Label(self.ai_unavailable_frame, text="AI Analysis unavailable.", bg=BG, fg=AMBER,
+                font=(SANS, 10, "bold")).pack(anchor="w", padx=16, pady=(4, 2))
+        tk.Label(self.ai_unavailable_frame, text="No AI provider is configured. Configure one in AI "
+                "Settings, or keep using Evidence mode.", bg=BG, fg=MUTED, font=(SANS, 9),
+                wraplength=860, justify="left").pack(anchor="w", padx=16, pady=(0, 6))
+        tk.Button(self.ai_unavailable_frame, text="Use Evidence Mode",
+                 command=lambda: self._set_mode("evidence"), bg="#181b1f", fg=TEXT, relief="flat",
+                 font=(MONO, 9), padx=10, pady=4, cursor="hand2").pack(anchor="w", padx=16, pady=(0, 10))
+
+        bar = tk.Frame(self.ai_frame, bg=BG); bar.pack(fill="x", padx=16, pady=(0, 6))
+        self._ai_ask_bar = bar
+        tk.Label(bar, text="ASK (AI)", bg=BG, fg=DIM, font=(MONO, 8)).pack(side="left")
+        self.ai_question_var = tk.StringVar()
+        ai_entry = tk.Entry(bar, textvariable=self.ai_question_var, bg=PANEL, fg=TEXT,
+                           insertbackground=TEXT, relief="flat", font=(SANS, 10))
+        ai_entry.pack(side="left", fill="x", expand=True, padx=(6, 8), ipady=4)
+        ai_entry.bind("<Return>", lambda _e: self._ai_ask())
+        self.ai_ask_button = tk.Button(bar, text="ASK", command=self._ai_ask, bg="#181b1f", fg=TEXT,
+                                       relief="flat", font=(MONO, 9), padx=12, pady=4, cursor="hand2")
+        self.ai_ask_button.pack(side="left")
+
+        panel = tk.Frame(self.ai_frame, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
+        panel.pack(fill="both", expand=True, padx=16, pady=(0, 14))
+        scroll = ScrollFrame(panel, bg=PANEL); scroll.pack(fill="both", expand=True, padx=2, pady=2)
+
+        self.ai_verdict_label = tk.Label(scroll.inner, text="", bg=PANEL, fg=MUTED, font=(MONO, 8, "bold"),
+                                         justify="left", anchor="nw")
+        self.ai_verdict_label.pack(fill="x", padx=14, pady=(12, 0), anchor="nw")
+        self.ai_answer_text = tk.Label(scroll.inner, text="", bg=PANEL, fg=TEXT, font=(SANS, 10),
+                                       justify="left", anchor="nw", wraplength=860)
+        self.ai_answer_text.pack(fill="x", padx=14, pady=(4, 4), anchor="nw")
+        self.ai_note_label = tk.Label(scroll.inner, text="", bg=PANEL, fg=AMBER, font=(SANS, 9, "italic"),
+                                      justify="left", anchor="nw", wraplength=860)
+        # not packed by default - only shown for a "corrected" verdict, see _render_ai_response()
+
+        self.ai_evidence_toggle_btn = tk.Button(scroll.inner, text="Show Evidence",
+                                                command=self._toggle_ai_evidence, bg="#181b1f", fg=MUTED,
+                                                relief="flat", font=(MONO, 8), padx=8, pady=3, cursor="hand2")
+        self.ai_evidence_toggle_btn.pack(anchor="w", padx=14, pady=(8, 4))
+        self.ai_evidence_container = tk.Frame(scroll.inner, bg=PANEL)
+        # not packed by default - toggled by _toggle_ai_evidence()
+        self.ai_evidence_text = tk.Label(self.ai_evidence_container, text="", bg=PANEL, fg=MUTED,
+                                         font=(MONO, 8), justify="left", anchor="nw", wraplength=860)
+        self.ai_evidence_text.pack(fill="x", padx=14, pady=(0, 12), anchor="nw")
+
+        self._refresh_ai_availability()
+
+    def _open_ai_settings(self):
+        """Opens the existing AISettingsWindow rather than rebuilding a settings form here -
+        reuses the same App-level singleton slot HistoryWindow.open_ai_settings() uses, so the two
+        entry points can never have two AISettingsWindow instances open at once."""
+        app = self.app
+        if app.ai_settings_window is not None and app.ai_settings_window.winfo_exists():
+            app.ai_settings_window.lift()
+            app.ai_settings_window.focus_force()
+            return
+        app.ai_settings_window = AISettingsWindow(app)
+
+    def _refresh_ai_availability(self):
+        if self.app.ai_adapter is None:
+            self.ai_unavailable_frame.pack(fill="x", before=self._ai_ask_bar)
+        else:
+            self.ai_unavailable_frame.pack_forget()
+        self._render_ai_status_line()
+
+    def _render_ai_status_line(self):
+        # Reads self.app.ai_config/.ai_adapter fresh every call - never a cached copy - so a
+        # provider change made through AISettingsWindow is reflected the next time this is drawn.
+        if self.app.ai_adapter is None:
+            self.ai_status_label.config(text="MODE: AI ANALYSIS   STATUS: Unavailable")
+            return
+        status = ai_settings.status_from_config(self.app.ai_config)
+        provider_label = AI_PROVIDER_LABELS.get(status.provider or "none", status.provider or "-")
+        model = status.model or "—"
+        self.ai_status_label.config(
+            text=f"MODE: AI ANALYSIS   PROVIDER: {provider_label}   MODEL: {model}   STATUS: {self._ai_status_text}")
+
+    def _set_ai_status(self, text):
+        self._ai_status_text = text
+        self._render_ai_status_line()
+
+    def _toggle_ai_evidence(self):
+        if self._ai_evidence_visible:
+            self.ai_evidence_container.pack_forget()
+            self.ai_evidence_toggle_btn.config(text="Show Evidence")
+        else:
+            self.ai_evidence_container.pack(fill="x", anchor="nw")
+            self.ai_evidence_toggle_btn.config(text="Hide Evidence")
+        self._ai_evidence_visible = not self._ai_evidence_visible
+
+    def _set_ai_evidence(self, evidence, grounding):
+        lines = _format_ai_evidence_lines(evidence, grounding)
+        self.ai_evidence_text.config(text="\n".join(lines) if lines else "No evidence was returned for this request.")
+
+    def _ai_ask(self, question=None):
+        if question is not None:
+            self.ai_question_var.set(question)
+        text = self.ai_question_var.get().strip()
+        # Read self.app.ai_adapter fresh, never a cached reference - this is what makes a config
+        # change made via AISettingsWindow take effect on the very next submit with no restart.
+        adapter = self.app.ai_adapter
+        self._refresh_ai_availability()
+        if adapter is None:
+            return  # unconfigured: no network activity is ever attempted
+        if not text:
+            return
+        if self._ai_request_in_flight:
+            return  # a request is already in flight - the ask control is also disabled below
+        self._ai_request_in_flight = True
+        self.ai_ask_button.config(state="disabled")
+        self._set_ai_status("Analyzing…")
+        result_queue = queue.Queue()
+        thread = threading.Thread(target=self._ai_worker, args=(adapter, text, result_queue), daemon=True)
+        thread.start()
+        self.after(100, self._poll_ai_answer, result_queue)
+
+    def _ai_worker(self, adapter, question, result_queue):
+        """Runs off the Tk main thread. Touches no widget - only the adapter and the queue. The
+        try/except here is belt-and-suspenders on top of UniversalAIAdapter.ask()'s own internal
+        safety (ai/provider_registry.py) so a truly unexpected error can never crash this thread
+        silently or leak a raw traceback anywhere."""
+        try:
+            response = adapter.ask(question)
+        except Exception:
+            response = ProviderResponse.failure("unknown", "provider_failure", "AI provider failed safely")
+        try:
+            result_queue.put(response)
+        except Exception:
+            pass  # nobody will ever read it (e.g. window destroyed) - harmless, see class docstring
+
+    def _poll_ai_answer(self, result_queue):
+        if not self.winfo_exists():
+            return  # window was closed mid-request - stop rescheduling, touch nothing
+        try:
+            response = result_queue.get_nowait()
+        except queue.Empty:
+            self.after(100, self._poll_ai_answer, result_queue)
+            return
+        self._ai_request_in_flight = False
+        if not self.winfo_exists():
+            return
+        try:
+            self.ai_ask_button.config(state="normal")
+        except tk.TclError:
+            pass
+        self._render_ai_response(response)
+
+    def _render_ai_response(self, response):
+        """The ONLY place an AI answer is ever drawn. Always renders response.answer/.grounding as
+        already produced by UniversalAIAdapter.ask() (which always runs GroundingGuard internally)
+        - there is no code path here that reads anything from a provider directly."""
+        self._ai_last_response = response
+        if response is None or not getattr(response, "ok", False) or getattr(response, "grounding", None) is None:
+            error = getattr(response, "error", None) or {}
+            message = error.get("message") or "the AI provider could not complete this request"
+            self._set_ai_status("Provider unavailable")
+            self.ai_verdict_label.config(text="RESULT: UNAVAILABLE", fg=AMBER)
+            self.ai_answer_text.config(text=f"AI Analysis unavailable: {message}", fg=AMBER)
+            self.ai_note_label.pack_forget()
+            self._set_ai_evidence([], None)
+            return
+        self._set_ai_status("Ready")
+        verdict = getattr(response.grounding, "verdict", "clean")
+        if verdict == "blocked":
+            self.ai_verdict_label.config(text="RESULT: BLOCKED (SAFE FAILURE)", fg=RED)
+            self.ai_answer_text.config(text=response.answer or "", fg=RED)
+            self.ai_note_label.pack_forget()
+        elif verdict == "corrected":
+            self.ai_verdict_label.config(text="RESULT: CORRECTED", fg=AMBER)
+            self.ai_answer_text.config(text=response.answer or "", fg=TEXT)
+            self.ai_note_label.config(
+                text="Note: Thermal Watch adjusted part of this answer to match its own recorded evidence.")
+            self.ai_note_label.pack(fill="x", padx=14, pady=(0, 8), anchor="nw", before=self.ai_evidence_toggle_btn)
+        else:
+            self.ai_verdict_label.config(text="RESULT: CLEAN", fg=GREEN)
+            self.ai_answer_text.config(text=response.answer or "", fg=TEXT)
+            self.ai_note_label.pack_forget()
+        self._set_ai_evidence(response.evidence, response.grounding)
+
+
+AI_PROVIDER_LABELS = {
+    "none": "Disabled (No AI)",
+    "nox": "Nox",
+    "openai_compatible": "OpenAI-Compatible",
+    "custom": "Custom",
+}
+AI_PROVIDER_ORDER = ("none", "nox", "openai_compatible", "custom")
+AI_STATUS_COLOR = {"Connected": GREEN, "Invalid configuration": RED, "Authentication failed": RED,
+                   "Endpoint unavailable": AMBER, "Model unavailable": AMBER, "Provider unavailable": AMBER}
+
+
+class AISettingsWindow(tk.Toplevel):
+    """Phase 16 - AI Integration Settings. Configures WHICH AI provider (if any) the optional
+    UniversalAIAdapter (ai/provider_registry.py, Phase 12) uses, and persists that choice
+    (ai/ai_settings.py) - settings/config only. This window never itself answers a question or
+    talks to a model; it only prepares the ProviderConfig that ai_settings.load_provider_config()
+    and App.reload_ai_config() turn into an adapter elsewhere. Saving or resetting here rebuilds
+    only App.ai_config/App.ai_adapter in memory - it never restarts, re-inits, or otherwise
+    touches sensor polling, incidents, sessions, or any other .after()-scheduled subsystem.
+
+    Fields shown are provider-specific, not a fixed form with irrelevant rows left visible:
+    Nox and Custom are supplied by a Python callable injected in code (not this screen), so their
+    network fields (endpoint/API key/allow-remote) are never even built for those providers;
+    only OpenAI-Compatible - the one provider a JSON settings file is actually enough to drive -
+    shows Endpoint/Model/API Key/Allow Remote."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title("Thermal Watch — AI Integration")
+        self.geometry("640x580")
+        self.minsize(560, 500)
+        self.configure(bg=BG)
+        apply_dark_titlebar(self)
+        self._build()
+        self._load_current()
+
+    def _build(self):
+        top = tk.Frame(self, bg=BG); top.pack(fill="x", padx=18, pady=(16, 4))
+        tk.Label(top, text="AI INTEGRATION", bg=BG, fg=TEXT, font=(MONO, 12, "bold")).pack(side="left")
+        tk.Label(self, text="Choose an optional AI provider for Ask Thermal Watch's evidence tool. "
+                            "Thermal Watch itself never generates or guesses text - a provider only ever "
+                            "sees read-only evidence through the same bounded tool every provider shares.",
+                bg=BG, fg=MUTED, font=(SANS, 9), justify="left", wraplength=580).pack(
+                    fill="x", padx=18, pady=(0, 10), anchor="w")
+
+        row = tk.Frame(self, bg=BG); row.pack(fill="x", padx=18, pady=(0, 6))
+        tk.Label(row, text="PROVIDER", bg=BG, fg=DIM, font=(MONO, 8), width=18, anchor="w").pack(side="left")
+        self.provider_var = tk.StringVar(value=AI_PROVIDER_LABELS["none"])
+        style_option_menu(tk.OptionMenu(row, self.provider_var,
+                                        *[AI_PROVIDER_LABELS[p] for p in AI_PROVIDER_ORDER],
+                                        command=lambda _v: self._rebuild_fields())
+                          ).pack(side="left", padx=(4, 0))
+
+        self.note_label = tk.Label(self, text="", bg=BG, fg=DIM, font=(SANS, 9), justify="left",
+                                   wraplength=580, anchor="w")
+        self.note_label.pack(fill="x", padx=18, pady=(4, 10))
+
+        self.fields_frame = tk.Frame(self, bg=BG)
+        self.fields_frame.pack(fill="x", padx=18)
+
+        self.endpoint_var = tk.StringVar()
+        self.model_var = tk.StringVar()
+        self.api_key_var = tk.StringVar()
+        self.allow_remote_var = tk.BooleanVar(value=False)
+
+        btns = tk.Frame(self, bg=BG); btns.pack(fill="x", padx=18, pady=(14, 6))
+        tk.Button(btns, text="TEST CONNECTION", command=self._test_connection, bg="#181b1f", fg=TEXT,
+                 relief="flat", font=(MONO, 9), padx=10, pady=5, cursor="hand2").pack(side="left")
+        tk.Button(btns, text="SAVE", command=self._save, bg="#181b1f", fg=TEXT, relief="flat",
+                 font=(MONO, 9), padx=10, pady=5, cursor="hand2").pack(side="left", padx=(8, 0))
+        tk.Button(btns, text="RESET / DISABLE", command=self._reset, bg="#181b1f", fg=TEXT, relief="flat",
+                 font=(MONO, 9), padx=10, pady=5, cursor="hand2").pack(side="left", padx=(8, 0))
+
+        self.status_label = tk.Label(self, text="", bg=BG, fg=DIM, font=(MONO, 9), justify="left",
+                                     wraplength=580, anchor="w")
+        self.status_label.pack(fill="x", padx=18, pady=(6, 4))
+
+        current = tk.Frame(self, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
+        current.pack(fill="both", expand=True, padx=18, pady=(6, 16))
+        tk.Label(current, text="ACTIVE CONFIGURATION", bg=PANEL, fg=DIM, font=(MONO, 8)).pack(
+            anchor="w", padx=12, pady=(10, 0))
+        self.current_label = tk.Label(current, text="", bg=PANEL, fg=TEXT, font=(MONO, 9),
+                                      justify="left", anchor="nw")
+        self.current_label.pack(fill="both", expand=True, padx=12, pady=(4, 10), anchor="nw")
+
+    def _row_entry(self, label, var, show=None):
+        row = tk.Frame(self.fields_frame, bg=BG); row.pack(fill="x", pady=(0, 8))
+        tk.Label(row, text=label, bg=BG, fg=DIM, font=(MONO, 8), width=18, anchor="w").pack(side="left")
+        kwargs = {"show": show} if show else {}
+        tk.Entry(row, textvariable=var, bg=PANEL, fg=TEXT, insertbackground=TEXT, relief="flat",
+                **kwargs).pack(side="left", fill="x", expand=True, padx=(4, 0), ipady=3)
+
+    def _selected_provider(self):
+        label_to_value = {v: k for k, v in AI_PROVIDER_LABELS.items()}
+        return label_to_value.get(self.provider_var.get(), "none")
+
+    def _rebuild_fields(self):
+        for w in self.fields_frame.winfo_children():
+            w.destroy()
+        provider = self._selected_provider()
+        if provider == "none":
+            self.note_label.config(text="AI is disabled. Ask Thermal Watch keeps working exactly as "
+                                        "before (the existing deterministic Ask) - no adapter is built.")
+        elif provider == "nox":
+            self.note_label.config(text="Nox queries Thermal Watch through its own local persona tool "
+                                        "loop. There is no endpoint, model, or API key for this screen to "
+                                        "collect, and no live connection test is possible from here - Nox "
+                                        "supplies its own transport in code, not through this config file.")
+        elif provider == "custom":
+            self.note_label.config(text="Custom expects a Python callable injected by code - there is no "
+                                        "callable a JSON settings file can itself supply. Selecting it here "
+                                        "only records the choice; it becomes usable once code injects a "
+                                        "handler.")
+        else:
+            self.note_label.config(text="OpenAI-compatible chat-completions endpoint (e.g. a local Ollama "
+                                        "or LM Studio server). A loopback endpoint (127.0.0.1/localhost) "
+                                        "works with no further action; a remote endpoint requires "
+                                        "explicitly checking Allow Remote below.")
+            self._row_entry("ENDPOINT", self.endpoint_var)
+            self._row_entry("MODEL", self.model_var)
+            self._row_entry("API KEY (optional)", self.api_key_var, show="*")
+            remote_row = tk.Frame(self.fields_frame, bg=BG); remote_row.pack(fill="x", pady=(2, 4))
+            tk.Checkbutton(remote_row, text="Allow remote (non-loopback) endpoint",
+                          variable=self.allow_remote_var, bg=BG, fg=TEXT, selectcolor=PANEL,
+                          activebackground=BG, activeforeground=TEXT, font=(SANS, 9)).pack(side="left")
+
+    def _load_current(self):
+        status = ai_settings.status_from_config(self.app.ai_config)
+        self.provider_var.set(AI_PROVIDER_LABELS.get(status.provider or "none", AI_PROVIDER_LABELS["none"]))
+        self.endpoint_var.set(status.endpoint or "")
+        self.model_var.set(status.model or "")
+        self.api_key_var.set("")  # never populated from disk - the plaintext key is never re-serialized
+        self.allow_remote_var.set(status.allow_remote)
+        self._rebuild_fields()
+        self._refresh_current_label(status)
+
+    def _refresh_current_label(self, status=None):
+        status = status or ai_settings.status_from_config(self.app.ai_config)
+        lines = [
+            f"Provider:      {AI_PROVIDER_LABELS.get(status.provider or 'none', status.provider)}",
+            f"Endpoint:      {status.endpoint or '-'}",
+            f"Model:         {status.model or '-'}",
+            f"Allow remote:  {status.allow_remote}",
+            f"API key saved: {status.credential_configured}",
+        ]
+        self.current_label.config(text="\n".join(lines))
+
+    def _collect_fields(self):
+        provider = self._selected_provider()
+        if provider == "none":
+            return {"provider": "none", "endpoint": None, "model": None, "allow_remote": False, "api_key": None}
+        if provider in ("nox", "custom"):
+            # Endpoint/API key/allow_remote are never shown in the UI for these providers - never
+            # sent even if a previous openai_compatible session left something in those variables.
+            model = self.model_var.get().strip() or None if provider == "custom" else None
+            return {"provider": provider, "endpoint": None, "model": model, "allow_remote": False, "api_key": None}
+        return {"provider": provider, "endpoint": self.endpoint_var.get().strip() or None,
+               "model": self.model_var.get().strip() or None, "allow_remote": bool(self.allow_remote_var.get()),
+               "api_key": self.api_key_var.get().strip() or None}
+
+    def _save(self):
+        fields = self._collect_fields()
+        if fields["provider"] == "none":
+            ai_settings.disable_provider()
+            self.app.reload_ai_config()
+            self.status_label.config(text="AI integration disabled and saved.", fg=DIM)
+            self._refresh_current_label()
+            return
+        try:
+            ai_settings.save_provider_config(**fields)
+        except ProviderContractError as exc:
+            self.status_label.config(text=f"Not saved - {exc.message}", fg=RED)
+            return
+        self.app.reload_ai_config()
+        self.api_key_var.set("")
+        self.status_label.config(text="Saved.", fg=DIM)
+        self._refresh_current_label()
+
+    def _reset(self):
+        ai_settings.disable_provider()
+        self.app.reload_ai_config()
+        self.provider_var.set(AI_PROVIDER_LABELS["none"])
+        self.endpoint_var.set("")
+        self.model_var.set("")
+        self.api_key_var.set("")
+        self.allow_remote_var.set(False)
+        self._rebuild_fields()
+        self.status_label.config(text="Reset - AI integration disabled.", fg=DIM)
+        self._refresh_current_label()
+
+    def _test_connection(self):
+        fields = self._collect_fields()
+        if fields["provider"] == "none":
+            self.status_label.config(text="Select a provider first.", fg=DIM)
+            return
+        result = ai_settings.test_connection(**fields)
+        color = AI_STATUS_COLOR.get(result["status"], DIM)
+        self.status_label.config(text=f"{result['status']} - {result['detail']}", fg=color)
 
 
 # 2-3 compatible-unit metric pairs a user can compare on one chart (item 12) - deliberately a
@@ -7483,10 +9051,14 @@ class TelemetryChart(tk.Canvas):
         def y_of(v):
             return plot_b - (v - vmin) / (vmax - vmin) * (plot_b - plot_t)
 
+        # Mbps commonly spans well under 1 across a whole range (e.g. idle periods) - at 0
+        # decimals every gridline would read "0", a uniquely uninformative axis for exactly the
+        # unit most likely to need one. Every other unit keeps its existing 0-decimal labels.
+        axis_prec = 1 if self.unit == " Mbps" else 0
         for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
             gy = plot_t + frac * (plot_b - plot_t)
             self.create_line(plot_l, gy, plot_r, gy, fill=BORDER2)
-            self.create_text(plot_l - 6, gy, text=f"{vmax - frac * (vmax - vmin):.0f}",
+            self.create_text(plot_l - 6, gy, text=f"{vmax - frac * (vmax - vmin):.{axis_prec}f}",
                              fill=DIM, font=(MONO, 7), anchor="e")
 
         def draw_line(points, value_key, color, dash=None):
@@ -7673,20 +9245,25 @@ class SensorHistoryWindow(tk.Toplevel):
         idle_baseline = compute_idle_baseline(filter_idle_buckets(buckets, sessions), self.sensor_ref)
 
         unit = self.sensor_ref["unit"]
-        self.current_label.config(text=f"Current: {current:.0f}{unit}" if current is not None else "Current: N/A")
+        # Mbps commonly sits under 1 for light/idle-ish periods - 0 decimals would render as an
+        # uninformative "0-0 Mbps" for exactly the ranges where the real number matters most (see
+        # the BASELINE section's own precision note in AnalyticsWindow for the same reasoning).
+        # Every other unit here (deg C, W, %) keeps its existing 0-decimal formatting unchanged.
+        prec = 1 if unit == " Mbps" else 0
+        self.current_label.config(text=f"Current: {current:.{prec}f}{unit}" if current is not None else "Current: N/A")
         self.chart.set_data(display_points, incidents, sessions, since_ts, now, unit,
                            show_max=self.show_max_var.get(), show_min=self.show_min_var.get(),
                            compare_points=compare_display)
 
         def fmt(v):
-            return f"{v:.0f}{unit}" if v is not None else "N/A"
+            return f"{v:.{prec}f}{unit}" if v is not None else "N/A"
 
         if idle_baseline and idle_baseline["established"]:
             if idle_baseline["stddev"] is not None:
                 lo, hi = idle_baseline["mean"] - idle_baseline["stddev"], idle_baseline["mean"] + idle_baseline["stddev"]
-                idle_line = f"Idle baseline: {lo:.0f}–{hi:.0f}{unit}  (n={idle_baseline['count']} idle buckets)"
+                idle_line = f"Idle baseline: {lo:.{prec}f}–{hi:.{prec}f}{unit}  (n={idle_baseline['count']} idle buckets)"
             else:
-                idle_line = f"Idle baseline: {idle_baseline['mean']:.0f}{unit}  (n={idle_baseline['count']} idle bucket)"
+                idle_line = f"Idle baseline: {idle_baseline['mean']:.{prec}f}{unit}  (n={idle_baseline['count']} idle bucket)"
         elif idle_baseline:
             idle_line = f"Idle baseline: not enough idle data yet ({idle_baseline['count']}/{BASELINE_MIN_IDLE_BUCKETS} buckets)"
         else:
@@ -7851,6 +9428,14 @@ class App(tk.Tk):
         self._active_incidents_dirty = False
         self.last_context = {}
         self.history_window = None
+        # Phase 17 - promoted from HistoryWindow so a single AISettingsWindow singleton is shared
+        # by both HistoryWindow's "AI Settings" menu entry and AskWindow's own "AI Settings"
+        # button; see HistoryWindow.ai_settings_window (the proxying property just above
+        # HistoryWindow.__init__) for the compatibility shim that keeps existing callers working.
+        self.ai_settings_window = None
+        self.connections_window = None
+        self._prev_net_adapter = _NET_STATE_UNSET  # v1.1 Phase 4 - see _detect_network_flight_events
+        self.network_zone_state = {"confirmed": "GREEN", "pending": {"zone": "GREEN", "since": time.time()}}
         self.sensor_history_windows = {}  # "kind:key" -> SensorHistoryWindow, one per distinct sensor
 
         # Workload session tracking (see the constants/helpers block above _incident_open et
@@ -7883,7 +9468,8 @@ class App(tk.Tk):
 
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.build()
-        threading.Thread(target=self.worker, daemon=True).start()
+        self.worker_thread = threading.Thread(target=self.worker, daemon=True)
+        self.worker_thread.start()
         self.after(100, self.poll)
         self.after(1000, self.tick_uptime)
         self.after(5000, self.check_bridge_health)
@@ -7892,6 +9478,31 @@ class App(tk.Tk):
         self.after(SESSION_RECONCILE_DELAY_MS, self._reconcile_restored_sessions)
         self.after(SESSION_ACTIVE_FLUSH_INTERVAL_MS, self._flush_active_sessions_periodic)
         self.after(REPORT_STARTUP_DELAY_MS, self._check_due_reports)
+        self.after(EVIDENCE_SNAPSHOT_INTERVAL_MS, self._flush_evidence_periodic)
+
+        # Phase 16 - AI Integration Settings. One-time, best-effort load: config only needs to
+        # (re)load at startup and whenever AISettingsWindow saves/resets it (via
+        # reload_ai_config() below), so no new recurring .after() timer is added here. Any
+        # failure - missing file, malformed JSON, wrong schema, a credential_ref that fails to
+        # decrypt - leaves ai_config/ai_adapter at their disabled defaults; monitoring is
+        # unaffected either way, and this never touches sensor polling, incident/session state,
+        # or any other .after() timer's cadence/order.
+        self.ai_config = None
+        self.ai_adapter = None
+        self.reload_ai_config()
+
+    def reload_ai_config(self):
+        """(Re)builds the in-memory AI provider config/adapter from the persisted Phase 16
+        settings file (ai/ai_settings.py). Called once at startup and again whenever
+        AISettingsWindow saves or resets a change - never restarts, re-inits, or otherwise
+        touches any monitoring subsystem. Best-effort and defensive: ai_settings.load_provider_
+        config() already never raises, but this wraps it too so a defect there can never take
+        down App.__init__ or a settings-window save."""
+        try:
+            self.ai_config = ai_settings.load_provider_config()
+        except (OSError, ValueError, TypeError):
+            self.ai_config = None
+        self.ai_adapter = None if self.ai_config is None else UniversalAIAdapter(self.ai_config)
 
     # -- scheduled health reports ---------------------------------------
     def _check_due_reports(self):
@@ -7931,7 +9542,7 @@ class App(tk.Tk):
         title_box = tk.Frame(header, bg=BG); title_box.pack(side="left")
         tk.Label(title_box, text="THERMAL", bg=BG, fg=TEXT, font=(MONO, 15, "bold")).pack(side="left")
         tk.Label(title_box, text="WATCH", bg=BG, fg=ORANGE, font=(MONO, 15, "bold")).pack(side="left")
-        tk.Label(title_box, text="v2.4", bg=BG, fg=DIM, font=(MONO, 9)).pack(side="left", padx=(10, 0), pady=(4, 0))
+        tk.Label(title_box, text=f"v{APP_VERSION}", bg=BG, fg=DIM, font=(MONO, 9)).pack(side="left", padx=(10, 0), pady=(4, 0))
 
         hw = tk.Frame(header, bg=BG, highlightthickness=1, highlightbackground=BORDER)
         self.hw_label = tk.Label(hw, text=self.info.get("cpu", "CPU"), bg=BG, fg="#c7ccd4", font=(SANS, 10))
@@ -8089,6 +9700,72 @@ class App(tk.Tk):
         self.ram_empty = self._make_empty_label(self.ram_panel, "No DIMM temperature sensors detected.")
         self.gpu_thermal_empty_shown = self.mobo_empty_shown = self.ram_empty_shown = False
 
+        # network (v1.1 Phase 1 - Network Foundation) - a new, purely additive row below the
+        # existing sensor panels; nothing above is resized, moved, or restyled. One full-width
+        # panel rather than the 3-column grid fan/voltage/drive use, since network has ONE
+        # active-adapter summary to show (whichever adapter GetBestInterfaceEx says currently
+        # carries real internet traffic - see active_network_snapshot()), not a variable-length
+        # per-sensor list.
+        net_row = tk.Frame(outer, bg=BG); net_row.pack(fill="x", pady=(12, 0))
+        self.net_panel = Panel(net_row, "NETWORK")
+        self.net_panel.pack(fill="x")
+
+        net_head = tk.Frame(self.net_panel.body, bg=PANEL); net_head.pack(fill="x", pady=(0, 10))
+        self.net_adapter_label = tk.Label(net_head, text="--", bg=PANEL, fg=TEXT, font=(MONO, 11))
+        self.net_adapter_label.pack(side="left")
+        self.net_state_label = tk.Label(net_head, text="", bg=PANEL, fg=DIM, font=(MONO, 9))
+        self.net_state_label.pack(side="left", padx=(10, 0))
+        self.net_speed_label = tk.Label(net_head, text="", bg=PANEL, fg=DIM, font=(MONO, 9))
+        self.net_speed_label.pack(side="right")
+
+        net_rates = tk.Frame(self.net_panel.body, bg=PANEL); net_rates.pack(fill="x")
+        for i in range(2):
+            net_rates.grid_columnconfigure(i, weight=1, uniform="net_rates")
+
+        def net_rate_cell(col, label_text):
+            cell = tk.Frame(net_rates, bg=PANEL)
+            cell.grid(row=0, column=col, sticky="w", padx=(0 if col == 0 else 24, 0))
+            tk.Label(cell, text=label_text, bg=PANEL, fg=DIM, font=(MONO, 8)).pack(anchor="w")
+            val = tk.Label(cell, text="--", bg=PANEL, fg=TEXT, font=(MONO, 20))
+            val.pack(anchor="w")
+            return val
+
+        self.net_down_label = net_rate_cell(0, "DOWNLOAD")
+        self.net_up_label = net_rate_cell(1, "UPLOAD")
+
+        net_detail = tk.Frame(self.net_panel.body, bg=PANEL); net_detail.pack(fill="x", pady=(10, 0))
+        self.net_detail_labels = {}
+        # "TOTAL" here means cumulative since the adapter itself last came up (the raw OS/driver
+        # counter - InOctets/OutOctets), NOT since Thermal Watch started watching. Labeling this
+        # "session" would imply a Thermal-Watch-scoped counter that doesn't exist yet.
+        for key, label_text in (("rx", "TOTAL RX"), ("tx", "TOTAL TX"),
+                                ("ip", "IP ADDRESS"), ("gw", "GATEWAY"), ("signal", "WI-FI SIGNAL"),
+                                ("connections", "CONNECTIONS")):
+            cell = tk.Frame(net_detail, bg=PANEL); cell.pack(side="left", padx=(0, 28))
+            tk.Label(cell, text=label_text, bg=PANEL, fg=DIM, font=(MONO, 8)).pack(anchor="w")
+            val = tk.Label(cell, text="--", bg=PANEL, fg=MUTED, font=(MONO, 10))
+            val.pack(anchor="w")
+            self.net_detail_labels[key] = {"cell": cell, "val": val}
+        self._bind_click(net_rates, lambda: self.open_sensor_history(scalar_sensor_ref("net_down_mbps")))
+        # v1.1 Phase 3 - clicking the connection count opens the full live list (same "clickable
+        # summary -> detail window" convention as net_rates -> SensorHistoryWindow above).
+        self._bind_click(self.net_detail_labels["connections"]["cell"], self.open_connections_window)
+
+        # Per-process network (v1.1 Phase 2) - purely additive below the existing adapter detail
+        # row, same panel rather than a second one, since it's still "network" at a glance. Rows
+        # are rebuilt each tick (see _update_network_process_list()), same pattern as
+        # RecommendationsWindow's card list - cheap at up to NET_TOP_PROCESS_COUNT rows/2s.
+        net_proc_header = tk.Frame(self.net_panel.body, bg=PANEL); net_proc_header.pack(fill="x", pady=(12, 4))
+        tk.Label(net_proc_header, text="TOP PROCESSES", bg=PANEL, fg=DIM, font=(MONO, 8)).pack(side="left")
+        self.net_proc_list = tk.Frame(self.net_panel.body, bg=PANEL)
+        self.net_proc_list.pack(fill="x")
+
+        tk.Label(self.net_panel.foot,
+                text="Active adapter only - whichever one Windows currently uses to reach the internet",
+                bg=PANEL, fg=DIM, font=(MONO, 9)).pack(side="left")
+        self.net_empty = self._make_empty_label(self.net_panel, "No active network adapter detected.")
+        self.net_empty_shown = False
+
         # stat strip
         strip = tk.Frame(outer, bg=BG); strip.pack(fill="x", pady=(12, 0))
         for i in range(6):
@@ -8160,11 +9837,47 @@ class App(tk.Tk):
         prev_proc_times = {}
         prev_sample_time = time.time()
         gpu_sampler = GpuProcessSampler()
+        # Network: prev_net carries the previous tick's (adapter index, byte counters, time) so
+        # active_network_snapshot() can compute a real Mbps rate - same "keep last sample on this
+        # thread" pattern as prev_proc_times above, never touched by the Tk main thread. IP/
+        # gateway/Wi-Fi signal change far less often than a 2s tick needs, so they're refreshed
+        # only every NET_SLOW_REFRESH_TICKS ticks (same throttling idea as the tick%2 LHM call
+        # below) rather than paying GetAdaptersAddresses/WLAN handle-open cost every single tick;
+        # the last known values are carried forward on the ticks in between, never blanked out.
+        prev_net = {}
+        net_slow = {"index": None, "ip_info": None, "wifi_signal": None}
+        # Per-process network (v1.1 Phase 2): prev_net_proc carries the previous tick's per-PID
+        # cumulative byte counters, same role as prev_net above but keyed by PID instead of a
+        # single adapter - see process_network_rates(). Correctly empty/inactive on a bridge
+        # that predates this feature or hasn't started ETW capture (e.g. still unprivileged).
+        prev_net_proc = {}
+        # Connection intelligence (v1.1 Phase 3): conn_name_cache persists across ticks so a PID
+        # already resolved once (e.g. a long-lived browser holding dozens of connections) never
+        # pays a fresh OpenProcess/QueryFullProcessImageNameW per tick - see active_connections().
+        conn_name_cache = {}
         while not self.stop_event.is_set():
             old_idle, old_total = self.last_cpu; now = cpu_times(); self.last_cpu = now
             dt = now[1] - old_total; load = 100 * (1 - (now[0] - old_idle) / dt) if dt else 0
             mem_pct, mem_used, mem_total = memory(); gpus = nvidia_stats()
             lhm = lhm_sensors() if tick % 2 == 0 else None
+
+            net, prev_net = active_network_snapshot(prev_net)
+            net_idx = net["adapter"]["index"] if net["adapter"] else None
+            if tick % NET_SLOW_REFRESH_TICKS == 0 or net_slow["index"] != net_idx:
+                net_slow = {"index": net_idx,
+                           "ip_info": adapter_ip_info(net_idx) if net_idx is not None else None,
+                           "wifi_signal": wifi_signal_percent() if net["adapter"] and net["adapter"]["type"] == "Wi-Fi" else None}
+            net["ip_info"] = net_slow["ip_info"]
+            net["wifi_signal"] = net_slow["wifi_signal"]
+
+            netproc_payload = network_processes()
+            netproc_rates, prev_net_proc = process_network_rates(netproc_payload, prev_net_proc)
+            netproc_rates.sort(key=lambda r: (r["down_mbps"] or 0) + (r["up_mbps"] or 0), reverse=True)
+            net_procs = {"capture_active": netproc_payload.get("capture_active", False),
+                        "capture_error": netproc_payload.get("capture_error"),
+                        "top": netproc_rates[:NET_TOP_PROCESS_COUNT]}
+
+            connections = active_connections(conn_name_cache)
 
             sample_time = time.time()
             curr_proc_times = _sample_process_cpu_times()
@@ -8176,7 +9889,8 @@ class App(tk.Tk):
             prev_proc_times, prev_sample_time = curr_proc_times, sample_time
 
             self.q.put({"time": datetime.now(), "cpu_load": load, "mem_pct": mem_pct, "mem_used": mem_used,
-                        "mem_total": mem_total, "gpus": gpus, "lhm": lhm, "workload": workload})
+                        "mem_total": mem_total, "gpus": gpus, "lhm": lhm, "workload": workload, "net": net,
+                        "net_procs": net_procs, "connections": connections})
             tick += 1
             self.stop_event.wait(POLL_SECONDS)
 
@@ -8226,8 +9940,8 @@ class App(tk.Tk):
     # -- data -> UI --------------------------------------------------------
     @staticmethod
     def _colors_for(kind):
-        return {"WARN": (ORANGE2, ALERT_BORDER), "CRIT": (AMBER, "#4a3a15"), "INFO": (MUTED, BORDER)}.get(
-            kind, (MUTED, BORDER))
+        return {"WARN": (ORANGE2, ALERT_BORDER), "CRIT": (AMBER, "#4a3a15"), "INFO": (MUTED, BORDER),
+                "NETWORK": (BLUE, "#1f3a52")}.get(kind, (MUTED, BORDER))
 
     def load_events(self):
         """Restore the event log from disk and prune entries past the retention window."""
@@ -8305,7 +10019,9 @@ class App(tk.Tk):
         _workload_tally (internal, underscore-prefixed to keep it out of completed records) is
         renamed to the plain, persisted `workload_tally`; _bias is dropped since it's cheaply
         re-derivable from `component` via INCIDENT_BIAS and isn't part of the incident's own
-        data."""
+        data. `evidence_id` (Phase 14) is not assigned until close, so a still-ACTIVE incident
+        simply has no such key here - the generic dict comprehension below already round-trips
+        it unchanged for any incident that DOES carry one (e.g. one snapshotted mid-restore)."""
         # _live_gap_pending is dropped alongside _bias: it is single-tick live state meaning
         # "the very next observation is the first since a gap". Persisting it would let a stale
         # flag survive a restart and wrongly mark a much later, ordinary recovery as having
@@ -8446,6 +10162,7 @@ class App(tk.Tk):
         tally = inc.pop("_workload_tally", {})
         inc["dominant_workload"] = self._dominant_workload(tally) or "Not identified"
         inc.pop("_bias", None)
+        assign_incident_evidence_id(inc)  # Phase 14: freeze once, right before the first persist
         self.incidents_recent.appendleft(inc)
         self._persist_incident(inc)
         sensor_name = inc.get("sensor_name", "Sensor")
@@ -8563,6 +10280,108 @@ class App(tk.Tk):
             self._save_active_incidents()
             self._active_incidents_dirty = False
         self.after(ACTIVE_INCIDENTS_FLUSH_INTERVAL_MS, self._flush_active_incidents_periodic)
+
+    # -- Evidence API (v1.1 Phase 10) - see the module-level design note near EVIDENCE_* consts -
+    def _build_evidence_snapshot(self):
+        """Assembles the full local evidence payload from state this app has ALREADY computed -
+        no new hardware polling, no new aggregation logic, no causal language anywhere in it.
+        Active incidents/sessions reuse the exact same sanitization/finalization helpers their
+        own durability paths already use (_incident_to_persistable, _finalize_session_record),
+        so the evidence file can never show a shape those consumers don't already trust. Recent
+        incidents/sessions and coverage are the same already-existing read/compute functions
+        every history view uses - never a second, competing calculation."""
+        now = time.time()
+        ctx = self.last_context or {}
+        # last_net/last_net_procs/last_connections are only ever set inside update_data() (see
+        # Phase 1-3), never in __init__ - if this periodic flush fires before the very first
+        # real worker tick completes (a real, if narrow, startup race - e.g. a slow first bridge
+        # connection), the plain attribute would not exist yet. getattr() with a default matches
+        # the same defensive pattern _sample_process_cpu_times() already uses for self._lhm.
+        net = getattr(self, "last_net", None) or {}
+        adapter = net.get("adapter") or {}
+        net_procs = getattr(self, "last_net_procs", None) or {}
+        connections = getattr(self, "last_connections", None) or []
+        fg = self.last_foreground or {}
+
+        active_incidents = [self._incident_to_persistable(key, inc) for key, inc in self.incidents_active.items()]
+        active_sessions = [self._finalize_session_record(rec, now, uncertain=False)
+                          for rec in self.workload_sessions.values() if rec.get("confirmed")]
+
+        recent_incidents = [i for i in read_incidents_file()
+                           if i.get("end_timestamp", 0) >= now - EVIDENCE_RECENT_WINDOW_S]
+        recent_sessions = [s for s in read_sessions_file()
+                          if s.get("end_timestamp", 0) >= now - EVIDENCE_RECENT_WINDOW_S]
+
+        buckets = read_telemetry_file(since_ts=now - EVIDENCE_RECENT_WINDOW_S)
+        valid_buckets, expected_buckets, coverage_pct = compute_coverage(buckets, EVIDENCE_RECENT_WINDOW_S)
+        # Phase 14 - Evidence IDs: citable monitoring-gap evidence for the same 24h window, each
+        # carrying the same COV-YYYYMMDD-NNNN id a direct timeline/coverage query would produce -
+        # see coverage_gap_events_for_day()/timeline_gap_events().
+        gap_events = timeline_gap_events(buckets, now - EVIDENCE_RECENT_WINDOW_S, now)
+        coverage_gaps = [
+            {"evidence_id": g["source_id"], "source_type": "coverage_gap",
+             "start_timestamp": g["timestamp"], "end_timestamp": g["end_timestamp"],
+             "duration_seconds": (g["end_timestamp"] or now) - g["timestamp"]}
+            for g in gap_events
+        ]
+
+        return {
+            "schema_version": EVIDENCE_SCHEMA_VERSION,
+            "generated_at": now,
+            "app_version": APP_VERSION,
+            "system": {
+                "cpu_model": self.info.get("cpu"), "cpu_cores": self.info.get("cores"),
+                "cpu_threads": self.info.get("threads"), "uptime_seconds": now - self.start_time,
+            },
+            "live": {
+                "cpu": {"temp_c": ctx.get("cpu_temp"), "load_pct": ctx.get("cpu_load"),
+                       "power_w": ctx.get("cpu_power"), "fan_rpm": ctx.get("cpu_fan_rpm")},
+                "gpu": {"core_temp_c": ctx.get("gpu_core_temp"), "hotspot_temp_c": ctx.get("gpu_hotspot_temp"),
+                       "vram_temp_c": ctx.get("gpu_vram_temp"), "load_pct": ctx.get("gpu_load"),
+                       "power_w": ctx.get("gpu_power"), "vram_used_mb": ctx.get("gpu_vram_used_mb"),
+                       "fan_pct": ctx.get("gpu_fan_pct")},
+                "memory": {"used_pct": ctx.get("mem_pct")},
+                "network": {
+                    "adapter_name": adapter.get("name"), "adapter_type": adapter.get("type"),
+                    "connected": adapter.get("media_connect_state"),
+                    "down_mbps": net.get("down_mbps"), "up_mbps": net.get("up_mbps"),
+                    "total_rx_bytes": adapter.get("in_octets"), "total_tx_bytes": adapter.get("out_octets"),
+                    "tcp_connections": sum(1 for c in connections if c.get("protocol") == "TCP"),
+                    "udp_connections": sum(1 for c in connections if c.get("protocol") == "UDP"),
+                    "per_process_capture_active": net_procs.get("capture_active", False),
+                    # Already-computed Phase 2 rows, copied as evidence for read-only external
+                    # clients. This does not poll, decode ETW, or recalculate rates.
+                    "top_processes": [dict(row) for row in (net_procs.get("top") or [])],
+                },
+                "bridge_health": compute_bridge_health(bridge_tier1_age(), bridge_status()),
+                "foreground_process": fg.get("name"),
+            },
+            "active_incidents": active_incidents,
+            "active_sessions": active_sessions,
+            "recent_incidents_24h": recent_incidents,
+            "recent_sessions_24h": recent_sessions,
+            "coverage_24h": {"valid_buckets": valid_buckets, "expected_buckets": expected_buckets,
+                             "coverage_pct": coverage_pct, "gaps": coverage_gaps},
+        }
+
+    def _write_evidence_snapshot(self):
+        """Atomic write (temp file + replace), same pattern as every other store in this app.
+        Best-effort and silent on failure: this is optional infrastructure for an external
+        reader that may not even exist - a write failure must never affect monitoring itself,
+        the same contract sensors.json's own writer already holds to."""
+        try:
+            payload = self._build_evidence_snapshot()
+            tmp = EVIDENCE_SNAPSHOT_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload), encoding="utf-8")
+            tmp.replace(EVIDENCE_SNAPSHOT_PATH)
+        except OSError:
+            pass
+
+    def _flush_evidence_periodic(self):
+        if self.stop_event.is_set():
+            return
+        self._write_evidence_snapshot()
+        self.after(EVIDENCE_SNAPSHOT_INTERVAL_MS, self._flush_evidence_periodic)
 
     # -- workload session tracking (see the module-level design note near SESSION_* consts) ---
     def load_sessions(self):
@@ -8724,6 +10543,7 @@ class App(tk.Tk):
         cpu_util, gpu_util, mem = m("cpu_util"), m("gpu_util"), m("mem_pct")
         cpu_power, gpu_power = m("cpu_power"), m("gpu_power")
         proc_cpu, proc_gpu = m("proc_cpu_pct"), m("proc_gpu_pct")
+        net_down, net_up = m("net_down_mbps"), m("net_up_mbps")
 
         out = {
             "session_id": record["session_id"], "workload_key": record["workload_key"],
@@ -8756,6 +10576,17 @@ class App(tk.Tk):
                 "peak_process_util": proc_gpu["peak"] if proc_gpu else None,
             },
             "memory": {"avg_pct": mem["avg"] if mem else None, "peak_pct": mem["peak"] if mem else None},
+            # v1.1 Phase 5 - Network Sessions. Whole-active-adapter Mbps observed while this
+            # workload was active (same semantic as cpu/gpu's avg/peak temps - an observed
+            # correlation, never a causal "this workload used N Mbps" claim). None on a session
+            # with zero net_down_mbps samples (e.g. every tick had no active adapter at all),
+            # matching every other block's "never fabricate a 0" rule.
+            "network": {
+                "avg_down_mbps": net_down["avg"] if net_down else None,
+                "peak_down_mbps": net_down["peak"] if net_down else None,
+                "avg_up_mbps": net_up["avg"] if net_up else None,
+                "peak_up_mbps": net_up["peak"] if net_up else None,
+            },
             "zone_time": {c: dict(t) for c, t in record.get("zone_time", {}).items()},
             "incident_ids": list(record.get("incident_ids", [])),
             "incident_count": len(record.get("incident_ids", [])),
@@ -8776,6 +10607,7 @@ class App(tk.Tk):
         if rec is None or not rec.get("confirmed", True):
             return
         completed = self._finalize_session_record(rec, now, uncertain, gap)
+        assign_session_evidence_id(completed)  # Phase 14: freeze once, right before the first persist
         self.sessions_recent.appendleft(completed)
         self._persist_session(completed)
         self._save_active_sessions()  # drop it from active persistence the moment it's completed
@@ -8869,6 +10701,8 @@ class App(tk.Tk):
         _agg_add(agg["mem_pct"], ctx.get("mem_pct"))
         _agg_add(agg["proc_cpu_pct"], entry.get("cpu_pct"))
         _agg_add(agg["proc_gpu_pct"], entry.get("gpu_pct"))
+        _agg_add(agg["net_down_mbps"], ctx.get("net_down_mbps"))
+        _agg_add(agg["net_up_mbps"], ctx.get("net_up_mbps"))
 
         if dt > 0:
             for comp, table in SESSION_ZONE_TABLES.items():
@@ -9136,6 +10970,7 @@ class App(tk.Tk):
         # with no gap looks exactly as it always has otherwise (item 10).
         inc.setdefault("monitoring_gaps", [])
         inc.setdefault("duration_exact", True)
+        assign_incident_evidence_id(inc)  # Phase 14: freeze once, right before the first persist
         self.incidents_recent.appendleft(inc)
         self._persist_incident(inc)
         self._save_active_incidents()  # item 9: drop it from active persistence the moment it's completed
@@ -9605,6 +11440,202 @@ class App(tk.Tk):
             return False
         return currently_shown
 
+    def _detect_network_flight_events(self, net):
+        """v1.1 Phase 4 - Network Flight Recorder. Logs a NETWORK-kind event whenever the active
+        adapter's identity or connection state genuinely changes (connected/disconnected,
+        active-adapter switch, e.g. Ethernet unplugged and Wi-Fi took over, link drop/restore on
+        the same adapter). Reuses the existing event log/timeline architecture entirely - no new
+        store, no new timeline builder: TIMELINE_LOG_KINDS already includes "NETWORK", so these
+        automatically appear on the Flight Recorder Timeline (Phase 14/v1.0) under the same EVENT
+        rows WARN/CRIT already use, filtered by the same "log" checkbox.
+
+        Never logs on the very first observation after startup - there is no PRIOR state to have
+        changed FROM yet, and treating "just started watching" as a network event would be a
+        fabricated transition, not an observed one."""
+        adapter = net.get("adapter")
+        curr = ({"index": adapter["index"], "name": adapter["name"], "type": adapter["type"],
+                "connected": adapter.get("media_connect_state")} if adapter else None)
+        prev = self._prev_net_adapter
+        if prev is _NET_STATE_UNSET:
+            self._prev_net_adapter = curr
+            return
+        if curr != prev:
+            if prev is None and curr is not None:
+                self.log_event("NETWORK", f"Network — connected via {curr['name']} ({curr['type']})")
+            elif prev is not None and curr is None:
+                self.log_event("NETWORK", f"Network — connectivity lost (was: {prev['name']})")
+            elif prev["index"] != curr["index"]:
+                self.log_event("NETWORK", f"Network — active adapter switched: {prev['name']} → {curr['name']}")
+            elif prev["connected"] != curr["connected"]:
+                state = "link restored" if curr["connected"] else "link down"
+                self.log_event("NETWORK", f"Network — {curr['name']} {state}")
+        self._prev_net_adapter = curr
+
+    def _update_network_zone(self, net):
+        """v1.1 Phase 6 - the zone-tracking half, structurally mirroring _update_sensor_zone()/
+        _transition_sensor_zone(): always keeps active_alerts/network_zone_state current,
+        UNCONDITIONALLY - never gated on incident_restore_pending, exactly like every thermal
+        sensor's zone engine isn't. This matters: _reconcile_restored_incidents() reads
+        active_alerts to decide whether to resume a restored incident, so that dict must reflect
+        live reality even while this component's OWN incident bookkeeping is still deferred
+        (see _incident_observe()'s docstring - the same split already exists there, just spread
+        across two calls instead of two methods for network's single always-on signal).
+
+        Debounce: losing connectivity needs ALERT_DEBOUNCE_S sustained (a route re-resolve blip
+        must not alert), recovery is immediate - the same "de-escalation never waits" rule every
+        thermal zone follows. Unlike that engine's "RED skips debounce" rule (justified there
+        because RED is the most severe of FOUR zones - alert instantly at the worst tier),
+        network only has two states, so RED here just means "disconnected" and still waits out
+        the full debounce like any other transition."""
+        connected = net.get("adapter") is not None
+        # Internal-only bookkeeping value for _reconcile_restored_incidents' "is this component
+        # still reporting anything at all" check - never rendered to the user as a real reading.
+        self.last_component_values["network"] = 1 if connected else 0
+        raw_key = "GREEN" if connected else "RED"
+
+        now = time.time()
+        state = self.network_zone_state
+        if raw_key != state["pending"]["zone"]:
+            state["pending"] = {"zone": raw_key, "since": now}
+        sustained = now - state["pending"]["since"]
+        confirmed = state["confirmed"]
+
+        if raw_key != confirmed and (raw_key == "GREEN" or sustained >= ALERT_DEBOUNCE_S):
+            state["confirmed"] = raw_key
+            if raw_key == "GREEN":
+                entry = self.active_alerts.pop("network", None)
+                if entry:
+                    dur = fmt_dur(now - entry["since"])
+                    self.log_event("INFO", f"Network connectivity — recovered after {dur}",
+                                  meta={"component": "network", "zone": "GREEN", "duration": dur})
+            else:
+                text = "Network connectivity — lost (no active adapter)"
+                self.active_alerts["network"] = {"since": now, "text": text, "zone": "RED"}
+                self.log_event("CRIT", text, meta={"component": "network", "zone": "RED"})
+
+    def _update_network_incident(self, net):
+        """v1.1 Phase 6 - the incident half: purely observes whatever _update_network_zone()
+        (called first, always) already decided about active_alerts["network"] this tick - makes
+        no zone/debounce decision of its own, exactly matching _incident_observe()'s own
+        contract ("makes no zone/threshold/debounce decision of its own, so an incident can
+        never open, escalate, or close on a different schedule than the alert engine already
+        governs"). Deferred entirely while a restart restore is pending, same as every other
+        component. value is always None throughout - open/touch/close all tolerate that already
+        (see _incident_touch: "if value is not None" guards the peak-tracking line) - a
+        connectivity incident's peak_value/start_value stay honestly None rather than a
+        fabricated numeric proxy, already rendered as "N/A"/"unknown peak" everywhere an
+        incident's peak is shown."""
+        self._update_network_zone(net)
+        key = "network"
+        if key in self.incident_restore_pending:
+            return  # awaiting _reconcile_restored_incidents() - do not touch it in the meantime
+        if key in self.active_alerts:
+            if key not in self.incidents_active:
+                self._incident_open(key, "network", "Network Connectivity", None, "RED", None)
+            self._incident_touch(key, self.active_alerts[key]["zone"], None)
+        elif key in self.incidents_active:
+            self._incident_close(key, None)
+
+    def _update_network_panel(self):
+        """Renders self.last_net (already set at the top of update_data) into the NETWORK panel.
+        Never fabricates: an unknown link speed shows "unknown", a None Mbps rate (first tick,
+        or the active adapter just changed - see active_network_snapshot()) shows "--", and no
+        adapter at all shows the empty-state label, matching every other panel's honesty rule."""
+        net = self.last_net or {}
+        adapter = net.get("adapter")
+        self.net_empty_shown = self._toggle_visible(self.net_empty, self.net_empty_shown,
+                                                     adapter is None, anchor="w", pady=4)
+        if adapter is None:
+            self.net_adapter_label.config(text="--")
+            self.net_state_label.config(text="")
+            self.net_speed_label.config(text="")
+            self.net_down_label.config(text="--")
+            self.net_up_label.config(text="--")
+            for refs in self.net_detail_labels.values():
+                refs["val"].config(text="--")
+            return
+
+        self.net_adapter_label.config(text=f"{adapter['name']} ({adapter['type']})")
+        connected = adapter.get("media_connect_state")
+        state_text = "CONNECTED" if connected else ("DISCONNECTED" if connected is False else "UNKNOWN")
+        state_color = GREEN if connected else (RED if connected is False else DIM)
+        self.net_state_label.config(text=f"● {state_text}", fg=state_color)
+
+        def fmt_link_speed(bps):
+            if bps is None:
+                return "unknown"
+            return f"{bps / 1e9:.1f} Gbps" if bps >= 1e9 else f"{bps / 1e6:.0f} Mbps"
+
+        rx_speed, tx_speed = fmt_link_speed(adapter.get("receive_link_speed_bps")), fmt_link_speed(adapter.get("transmit_link_speed_bps"))
+        self.net_speed_label.config(text=f"LINK {rx_speed} ↓ / {tx_speed} ↑")
+
+        def fmt_mbps(v):
+            return f"{v:.2f}" if v is not None else "--"
+
+        self.net_down_label.config(text=fmt_mbps(net.get("down_mbps")))
+        self.net_up_label.config(text=fmt_mbps(net.get("up_mbps")))
+
+        self.net_detail_labels["rx"]["val"].config(text=fmt_net_bytes(adapter.get("in_octets")))
+        self.net_detail_labels["tx"]["val"].config(text=fmt_net_bytes(adapter.get("out_octets")))
+        ip_info = net.get("ip_info") or {}
+        self.net_detail_labels["ip"]["val"].config(text=ip_info.get("ipv4") or "N/A")
+        self.net_detail_labels["gw"]["val"].config(text=ip_info.get("gateway") or "N/A")
+        signal = net.get("wifi_signal")
+        is_wifi = adapter.get("type") == "Wi-Fi"
+        # Wi-Fi signal is only ever meaningful for a Wi-Fi adapter - shown as N/A rather than
+        # hidden on Ethernet, so the field's absence reads as "not applicable", not "broken".
+        self.net_detail_labels["signal"]["val"].config(text=f"{signal}%" if is_wifi and signal is not None else "N/A")
+
+        # v1.1 Phase 3 - connection count summary, click to open the full live list.
+        conns = self.last_connections or []
+        tcp_n = sum(1 for c in conns if c["protocol"] == "TCP")
+        udp_n = sum(1 for c in conns if c["protocol"] == "UDP")
+        self.net_detail_labels["connections"]["val"].config(text=f"{tcp_n} TCP · {udp_n} UDP")
+
+    def open_connections_window(self):
+        """Opens ConnectionsWindow (v1.1 Phase 3), reusing an already-open instance rather than
+        stacking duplicates - same convention as open_sensor_history's per-key window cache."""
+        if getattr(self, "connections_window", None) is not None and self.connections_window.winfo_exists():
+            self.connections_window.lift()
+            self.connections_window.focus_force()
+            return
+        self.connections_window = ConnectionsWindow(self)
+
+    def _update_network_process_list(self):
+        """Renders self.last_net_procs (v1.1 Phase 2) into the TOP PROCESSES rows below the
+        adapter summary. Requires the elevated bridge's ETW capture (see network_processes() /
+        process_network_rates()) - on an older bridge, one that hasn't started capture, or while
+        unprivileged, capture_active is honestly False and the panel says so instead of showing
+        an empty list that could be misread as "confirmed zero per-process traffic"."""
+        info = self.last_net_procs or {}
+        for w in self.net_proc_list.winfo_children():
+            w.destroy()
+
+        if not info.get("capture_active"):
+            reason = info.get("capture_error")
+            text = "Per-process attribution unavailable" + (f" ({reason})" if reason else " - waiting on the elevated bridge")
+            tk.Label(self.net_proc_list, text=text, bg=PANEL, fg=DIM, font=(MONO, 9),
+                    anchor="w", justify="left").pack(fill="x", anchor="w")
+            return
+
+        top = info.get("top") or []
+        if not top:
+            tk.Label(self.net_proc_list, text="No per-process traffic observed this interval",
+                    bg=PANEL, fg=DIM, font=(MONO, 9), anchor="w").pack(fill="x", anchor="w")
+            return
+
+        def fmt_mbps(v):
+            return f"{v:.2f}" if v is not None else "--"
+
+        for proc in top:
+            row = tk.Frame(self.net_proc_list, bg=PANEL); row.pack(fill="x", pady=(0, 3))
+            name = proc.get("name") or f"pid {proc['pid']}"
+            tk.Label(row, text=name, bg=PANEL, fg=TEXT, font=(MONO, 9), width=22, anchor="w").pack(side="left")
+            tk.Label(row, text=f"↓ {fmt_mbps(proc['down_mbps'])} Mbps", bg=PANEL, fg=MUTED,
+                    font=(MONO, 9), width=16, anchor="w").pack(side="left")
+            tk.Label(row, text=f"↑ {fmt_mbps(proc['up_mbps'])} Mbps", bg=PANEL, fg=MUTED,
+                    font=(MONO, 9), width=16, anchor="w").pack(side="left")
+
     def update_data(self, d):
         # Before anything observes this tick: did the wall clock jump while we were suspended?
         # Must run first so the pre-gap telemetry bucket is closed and open incidents/sessions
@@ -9623,6 +11654,16 @@ class App(tk.Tk):
         if d["lhm"] is not None:
             self._lhm = d["lhm"]
         sensors = getattr(self, "_lhm", [])
+
+        # Network (v1.1 Phase 1). Kept as its own attribute, not folded into last_context, since
+        # the live panel needs more than scalar numbers - adapter identity/type/link state/IP/
+        # gateway/Wi-Fi signal - the same "raw snapshot separate from derived scalars" split
+        # self._lhm/last_context already uses.
+        self.last_net = d.get("net") or {}
+        self._detect_network_flight_events(self.last_net)
+        self._update_network_incident(self.last_net)
+        self.last_net_procs = d.get("net_procs") or {"capture_active": False, "capture_error": None, "top": []}
+        self.last_connections = d.get("connections") or []
 
         def find(sensor_type, predicate):
             return [s for s in sensors if s.get("SensorType") == sensor_type and predicate(s)]
@@ -9867,7 +11908,13 @@ class App(tk.Tk):
             "cpu_fan_rpm": float(cpu_fan["Value"]) if cpu_fan and cpu_fan.get("Value") is not None else None,
             "gpu_fan_pct": gpu.get("fan"),
             "system_temp": system_temp,
+            "net_down_mbps": self.last_net.get("down_mbps"),
+            "net_up_mbps": self.last_net.get("up_mbps"),
+            "net_rx_bytes": self.last_net["adapter"]["in_octets"] if self.last_net.get("adapter") else None,
+            "net_tx_bytes": self.last_net["adapter"]["out_octets"] if self.last_net.get("adapter") else None,
         }
+        self._update_network_panel()
+        self._update_network_process_list()
 
         def build_zone_row(parent):
             row = tk.Frame(parent, bg=PANEL); row.pack(fill="x", pady=3)
@@ -10119,6 +12166,62 @@ class App(tk.Tk):
             self._telemetry_finalize_bucket(time.time())
         self.stop_event.set()
         self.destroy()
+
+    # Names of App's own recurring, self-rescheduling after() callbacks - see destroy() for why
+    # this exact list, not a blanket sweep of every pending after() id in the interpreter.
+    _RECURRING_AFTER_METHODS = ("poll", "tick_uptime", "check_bridge_health",
+                                "_reconcile_restored_incidents", "_flush_active_incidents_periodic",
+                                "_reconcile_restored_sessions", "_flush_active_sessions_periodic",
+                                "_check_due_reports", "_flush_evidence_periodic")
+
+    def destroy(self):
+        """Cancels App's own pending recurring after() callbacks and joins worker() before
+        tearing down the Tcl interpreter.
+
+        __init__ schedules 7 recurring after() callbacks (poll, tick_uptime,
+        check_bridge_health, the report/incident/session reconcile-and-flush timers) that keep
+        rescheduling themselves indefinitely - by definition, AT LEAST one is always pending, no
+        matter how much time has passed since __init__. Plain destroy() never cancelled any of
+        them. A pending callback firing AFTER the interpreter is torn down looks exactly like the
+        observed symptom - "invalid command name ...poll/...tick_uptime" - and can corrupt Tcl's
+        own thread-safety bookkeeping badly enough to crash the interpreter (Tcl_AsyncDelete:
+        async handler deleted by the wrong thread), not just print a warning. Reproduced via
+        tools/verify_persistence_integrity.py's rapid create-then-immediately-destroy pattern.
+
+        Scoped to these 7 names specifically, NOT a blanket `self.tk.eval('after info')` sweep of
+        every pending id in the (shared, interpreter-wide) after-queue: after_cancel() deletes
+        the underlying Tcl command regardless of which widget object originally registered it,
+        so cancelling an id that actually belongs to a still-open CHILD Toplevel (e.g. a
+        HistoryWindow left open when the main window closes - a normal, legitimate case, exactly
+        what tools/verify_incident_analytics.py does) deletes that command out from under the
+        child without the child's own bookkeeping knowing, and its later, completely normal
+        self.destroy() call then fails with "can't delete Tcl command" trying to delete it again.
+        Confirmed by hitting exactly that failure with the blanket-sweep version - fixed by
+        matching only on these known method names, found via each id's registered Tcl command
+        name (which Tkinter derives from the bound method), never touching a child window's own
+        callbacks.
+
+        Cancelling first, then joining the worker thread (still needed: worker() runs real OS
+        work on its own thread and touches self.q, which must not still be alive when the
+        interpreter goes away), covers both real halves of the original race. Every caller
+        (close(), and every verify script's own stop_event.set() + destroy()) already expresses
+        "shut down now" intent immediately before calling destroy() - this just makes that intent
+        actually clean rather than requiring every call site to know about either hazard."""
+        self.stop_event.set()
+        try:
+            for after_id in self.tk.eval("after info").split():
+                try:
+                    command = self.tk.call("after", "info", after_id)[0]
+                except tk.TclError:
+                    continue  # already fired/cancelled between listing and inspecting it
+                if any(str(command).endswith(name) for name in self._RECURRING_AFTER_METHODS):
+                    self.after_cancel(after_id)
+        except tk.TclError:
+            pass  # interpreter already gone - nothing to cancel, not an error
+        worker_thread = getattr(self, "worker_thread", None)
+        if worker_thread is not None and worker_thread.is_alive():
+            worker_thread.join(timeout=POLL_SECONDS + 2)
+        super().destroy()
 
 
 if __name__ == "__main__":

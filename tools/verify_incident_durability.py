@@ -1,4 +1,5 @@
 """Verification for active-incident durability across close/crash/restart."""
+import gc
 import json
 import sys
 import time
@@ -16,6 +17,24 @@ def fresh_files():
     tmp = ACTIVE_INCIDENTS_PATH.with_suffix(".tmp")
     if tmp.exists():
         tmp.unlink()
+
+
+def destroy_test_app(app):
+    """Destroy one test-only Tk root and finalize its widget cycles on Tk's owner thread.
+
+    This verifier creates many App/Tk roots in one process, unlike production.  Merely destroying
+    a root leaves cyclic widget graphs eligible for collection later; if the next App worker happens
+    to trigger cyclic GC, Tcl finalizers then run on that worker and abort with Tcl_AsyncDelete.
+    Returning None lets each caller release its last root reference before collecting deterministically
+    on the main/Tk thread.  No event-loop pumping or timing delay is involved.
+    """
+    app.stop_event.set()
+    app.destroy()
+    return None
+
+
+def collect_destroyed_root():
+    gc.collect()
 
 
 def tick_cpu(app, temp):
@@ -57,7 +76,8 @@ def main():
     assert closed["monitoring_gaps"] == []
     assert closed["duration_exact"] is True
     print(f"  PASS: normal incident closed with monitoring_gaps=[] duration_exact=True (id={inc_id})")
-    app.stop_event.set(); app.destroy()
+    app = destroy_test_app(app)
+    collect_destroyed_root()
     fresh_files()
 
     print("\n=== B. restart while still hot ===")
@@ -68,7 +88,8 @@ def main():
     on_disk = read_active_file()
     assert "cpu" in on_disk and on_disk["cpu"]["incident_id"] == inc_id_b, "FAIL: not persisted to active file"
     print(f"  incident persisted to {ACTIVE_INCIDENTS_PATH.name} before 'crash' (no clean close called)")
-    app1.stop_event.set(); app1.destroy()  # simulate crash: no close(), no final save - already saved by _incident_open
+    app1 = destroy_test_app(app1)  # simulate crash: no close(), no final save - already saved by _incident_open
+    collect_destroyed_root()
 
     app2 = App()  # fresh process, loads active file in build()
     assert "cpu" in app2.incident_restore_pending, "FAIL: did not load pending restore"
@@ -90,14 +111,16 @@ def main():
     assert len(app2.incidents_recent) == 0, "FAIL: should not have been closed"
     print(f"  PASS: resumed same incident_id={resumed['incident_id']}, start/peak preserved, "
           f"gap recorded ({resumed['monitoring_gaps'][0]['gap_seconds']:.1f}s)")
-    app2.stop_event.set(); app2.destroy()
+    app2 = destroy_test_app(app2)
+    collect_destroyed_root()
     fresh_files()
 
     print("\n=== C. recovered while offline ===")
     app1 = App()
     inc_id_c = open_cpu_incident(app1)
     peak_c = app1.incidents_active["cpu"]["peak_value"]
-    app1.stop_event.set(); app1.destroy()
+    app1 = destroy_test_app(app1)
+    collect_destroyed_root()
 
     app2 = App()
     assert "cpu" in app2.incident_restore_pending
@@ -118,14 +141,16 @@ def main():
     assert closed["first_observed_recovered_value"] == 45.0
     print(f"  PASS: closed with recovery_during_monitoring_gap=True, duration_exact=False, "
           f"recovery_value=None (not fabricated), first_observed_recovered_value=45.0")
-    app2.stop_event.set(); app2.destroy()
+    app2 = destroy_test_app(app2)
+    collect_destroyed_root()
     fresh_files()
 
     print("\n=== D. escalation while offline (Yellow -> restart -> Red) ===")
     app1 = App()
     inc_id_d = open_cpu_incident(app1)  # opens at YELLOW
     assert app1.incidents_active["cpu"]["max_zone"] == "YELLOW"
-    app1.stop_event.set(); app1.destroy()
+    app1 = destroy_test_app(app1)
+    collect_destroyed_root()
 
     app2 = App()
     tick_cpu(app2, 101.0)  # RED - immediate, no debounce
@@ -137,7 +162,8 @@ def main():
     assert resumed["starting_zone"] == "YELLOW"
     assert resumed["max_zone"] == "RED", "FAIL: max_zone not updated to reflect current Red state"
     print(f"  PASS: same incident_id={resumed['incident_id']}, starting_zone=YELLOW preserved, max_zone updated to RED")
-    app2.stop_event.set(); app2.destroy()
+    app2 = destroy_test_app(app2)
+    collect_destroyed_root()
     fresh_files()
 
     print("\n=== E. multiple simultaneous incidents restore independently ===")
@@ -149,7 +175,8 @@ def main():
     assert "sensor:gpu_hotspot" in app1.incidents_active
     gpu_id = app1.incidents_active["sensor:gpu_hotspot"]["incident_id"]
     assert cpu_id != gpu_id
-    app1.stop_event.set(); app1.destroy()
+    app1 = destroy_test_app(app1)
+    collect_destroyed_root()
 
     app2 = App()
     assert set(app2.incident_restore_pending.keys()) == {"cpu", "sensor:gpu_hotspot"}
@@ -159,7 +186,8 @@ def main():
     assert app2.incidents_active["cpu"]["incident_id"] == cpu_id
     assert app2.incidents_active["sensor:gpu_hotspot"]["incident_id"] == gpu_id
     print(f"  PASS: both incidents resumed independently with original ids ({cpu_id}, {gpu_id})")
-    app2.stop_event.set(); app2.destroy()
+    app2 = destroy_test_app(app2)
+    collect_destroyed_root()
     fresh_files()
 
     print("\n=== F. corrupt active-state file: app must still launch normally ===")
@@ -169,7 +197,8 @@ def main():
         ACTIVE_INCIDENTS_PATH.write_text(content, encoding="utf-8")
         app = App()
         assert app.incident_restore_pending == {}, f"FAIL ({label}): should restore nothing from corrupt data"
-        app.stop_event.set(); app.destroy()
+        app = destroy_test_app(app)
+        collect_destroyed_root()
         print(f"  PASS ({label}): app started fine, restore_pending empty")
     if ACTIVE_INCIDENTS_PATH.exists():
         ACTIVE_INCIDENTS_PATH.unlink()
@@ -198,13 +227,15 @@ def main():
     assert closed["recovery_during_monitoring_gap"] is False
     assert closed["first_observed_recovered_value"] is None
     print("  PASS: closed with close_reason='sensor_unavailable', not silently deleted, not fabricated as recovered")
-    app.stop_event.set(); app.destroy()
+    app = destroy_test_app(app)
+    collect_destroyed_root()
     fresh_files()
 
     print("\n=== H. idempotency: reconciliation/restoration never double-appends a completed incident ===")
     app1 = App()
     inc_id_h = open_cpu_incident(app1)
-    app1.stop_event.set(); app1.destroy()
+    app1 = destroy_test_app(app1)
+    collect_destroyed_root()
 
     app2 = App()
     tick_cpu(app2, 40.0)  # nominal -> will close as recovered-during-gap
@@ -224,7 +255,8 @@ def main():
     assert lines_in_file_after == 1, f"FAIL: duplicate append, file now has {lines_in_file_after} lines"
     print(f"  PASS: re-running restoration against an already-completed incident appended nothing new "
           f"(file still has {lines_in_file_after} line)")
-    app2.stop_event.set(); app2.destroy()
+    app2 = destroy_test_app(app2)
+    collect_destroyed_root()
     fresh_files()
 
     print("\nALL DURABILITY CHECKS PASSED, NO TRACEBACK")

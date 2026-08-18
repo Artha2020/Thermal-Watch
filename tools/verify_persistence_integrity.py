@@ -5,6 +5,7 @@ All of it runs against SANDBOX copies - _verify_sandbox is imported before app, 
 constant points into a temp directory and no production file is ever the subject of a corruption
 test. This exists because the recovery paths are the ones a user only exercises on their worst day,
 and an untested recovery path is indistinguishable from a data-loss bug."""
+import gc
 import json
 import sys
 import time
@@ -41,6 +42,17 @@ VALID_LINE = {
                    "component": "gpu"},
     "event log": {"ts": NOW - 60, "kind": "WARN", "text": "something happened"},
 }
+
+
+def destroy_test_app(app):
+    """Release a test-only Tk root and collect its widget cycles on the Tk-owning thread."""
+    app.stop_event.set()
+    app.destroy()
+    return None
+
+
+def collect_destroyed_root():
+    gc.collect()
 
 
 def clear_all():
@@ -106,7 +118,8 @@ def main():
         assert preserved[0].stat().st_size > 0, "the preserved copy must still hold the original bytes"
         assert reader() == [], f"FAIL: the fresh {label} store should be empty"
     app = App()
-    app.stop_event.set(); app.destroy()
+    app = destroy_test_app(app)
+    collect_destroyed_root()
     print("  PASS: both SQLite stores rename the corrupt file aside (never delete it), create a fresh "
           "store, and App() still starts afterwards")
 
@@ -128,7 +141,8 @@ def main():
         path.write_text('{"saved_at": 123, "incidents": [ truncated', encoding="utf-8")
     app = App()
     app.update()
-    app.stop_event.set(); app.destroy()
+    app = destroy_test_app(app)
+    collect_destroyed_root()
     print("  PASS: half-written active-incident and active-session snapshots are tolerated and the app "
           "starts normally")
 
@@ -139,7 +153,8 @@ def main():
     bucket["scalars"]["cpu_temp"] = {"sum": 100.0, "min": 49.0, "max": 51.0, "count": 2}
     app = App()
     app._persist_telemetry_bucket(bucket)
-    app.stop_event.set(); app.destroy()
+    app = destroy_test_app(app)
+    collect_destroyed_root()
     conn.close()
     reread = read_telemetry_file()
     assert len(reread) == 1 and reread[0]["scalars"]["cpu_temp"]["avg"] == 50.0, reread

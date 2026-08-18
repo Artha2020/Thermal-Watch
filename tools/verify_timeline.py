@@ -33,10 +33,11 @@ STORES = (EVENT_LOG_PATH, INCIDENTS_PATH, SESSIONS_PATH, EXPERIMENTS_PATH)
 
 
 def fresh_files():
-    """Clear this script's fixture stores. Safe by construction: _verify_sandbox (imported above,
+    """Clears this script's fixture stores. Safe by construction: _verify_sandbox (imported above,
     before app) has already pointed every store constant at a temp directory, so these paths cannot
-    resolve to the machine's real history. tools/verify_isolation.py independently proves that the
-    guarantee holds across the whole suite."""
+    resolve to the machine's real history. An earlier version of this script had no such guarantee
+    and unlinked the production event log for real - see tools/verify_isolation.py, which proves
+    the guarantee holds across the whole suite rather than trusting this comment."""
     for p in STORES:
         if p.exists():
             p.unlink()
@@ -146,16 +147,23 @@ def main():
     assert any("not exact" in d for d in detail), detail
     print("  PASS: 'Duration contains an unmonitored interval and is not exact.' is carried onto the timeline")
 
-    print("\n=== 8. INFO log chatter is filtered out by default; WARN/CRIT are kept ===")
+    print("\n=== 8. INFO log chatter is filtered out by default; WARN/CRIT/NETWORK are kept ===")
     records = [{"ts": NOW - HOUR, "kind": "INFO", "text": "Polling interval set to 2000ms"},
               {"ts": NOW - HOUR, "kind": "WARN", "text": "Bridge stale"},
-              {"ts": NOW - HOUR, "kind": "CRIT", "text": "CPU Package entered RED"}]
+              {"ts": NOW - HOUR, "kind": "CRIT", "text": "CPU Package entered RED"},
+              {"ts": NOW - HOUR, "kind": "NETWORK", "text": "Network — connected via Ethernet"}]
     kept = timeline_log_events(records, start_ts, end_ts)
-    assert {e["title"] for e in kept} == {"Bridge stale", "CPU Package entered RED"}, kept
-    assert len(timeline_log_events(records, start_ts, end_ts, kinds=("INFO", "WARN", "CRIT"))) == 3, \
+    assert {e["title"] for e in kept} == {"Bridge stale", "CPU Package entered RED",
+                                          "Network — connected via Ethernet"}, kept
+    assert len(timeline_log_events(records, start_ts, end_ts, kinds=("INFO", "WARN", "CRIT", "NETWORK"))) == 4, \
         "FAIL: the INFO filter must be a parameter, not hard-coded - nothing is deleted, only not shown"
-    assert TIMELINE_LOG_KINDS == ("WARN", "CRIT")
-    print("  PASS: lifecycle INFO chatter is excluded by default, and including it is one argument away")
+    # NETWORK (v1.1 Phase 4, Network Flight Recorder) is a deliberate, additive extension of this
+    # same default set - adapter connect/disconnect/switch events reuse the existing event log/
+    # timeline architecture rather than a new store or a new timeline kind. WARN/CRIT stay exactly
+    # as they were; nothing here is a replacement.
+    assert TIMELINE_LOG_KINDS == ("WARN", "CRIT", "NETWORK")
+    print("  PASS: lifecycle INFO chatter is excluded by default, WARN/CRIT/NETWORK are kept, and "
+          "including any other kind is one argument away")
 
     print("\n=== 9. build_timeline: every store on ONE axis, newest first, with a deterministic tie-break ===")
     same_ts = NOW - 8 * HOUR
