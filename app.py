@@ -13385,7 +13385,7 @@ class App(tk.Tk):
         telemetry_sensor_samples = []
 
         disk_specs = []
-        for dsk in disk_temps[:4]:
+        for dsk in disk_temps:
             drive_key = dsk.get("Parent", "DISK")
             drive_name = drive_key.replace("Storage ", "").strip()
             raw = dsk.get("Value")
