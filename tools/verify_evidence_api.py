@@ -1,10 +1,12 @@
-"""Verification for v1.1 Phase 10 - Evidence API.
+"""Verification for v1.1 Phase 10 - Evidence API (file half; see verify_evidence_pipe.py for the
+Phase 12 named-pipe half).
 
-File-based, not a network service: Thermal Watch periodically writes a structured snapshot to
-EVIDENCE_SNAPSHOT_PATH (same atomic tmp-then-replace pattern as every other store), and any
-process that can read a file - Nox, a script, a human - can consume it. No listening socket, no
-new attack surface. Every section is assembled from already-computed state or an already-existing
-read function - active incidents/sessions reuse _incident_to_persistable()/
+Two channels now read from the same periodically-built snapshot. Thermal Watch still writes it
+to EVIDENCE_SNAPSHOT_PATH (same atomic tmp-then-replace pattern as every other store) so any
+process that can read a file - Nox, a script, a human - can still consume it, and also caches the
+same dict for the local-only named pipe Nox now uses as its live, fail-fast channel (see
+app._pipe_evidence_loader). Every section is assembled from already-computed state or an
+already-existing read function - active incidents/sessions reuse _incident_to_persistable()/
 _finalize_session_record() verbatim, recent incidents/sessions/coverage reuse the same read/
 compute functions every history view already uses.
 """
@@ -17,8 +19,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import _verify_sandbox  # noqa: E402,F401  - MUST precede `import app`
 from app import (  # noqa: E402
     App, EVIDENCE_SCHEMA_VERSION, EVIDENCE_SNAPSHOT_PATH, EVIDENCE_SNAPSHOT_INTERVAL_MS,
-    EVIDENCE_RECENT_WINDOW_S, APP_VERSION, INCIDENTS_PATH, ACTIVE_INCIDENTS_PATH,
-    SESSIONS_PATH, ACTIVE_SESSIONS_PATH,
+    EVIDENCE_SNAPSHOT_FIRST_FLUSH_MS, EVIDENCE_RECENT_WINDOW_S, APP_VERSION, INCIDENTS_PATH,
+    ACTIVE_INCIDENTS_PATH, SESSIONS_PATH, ACTIVE_SESSIONS_PATH, cpu_effective_clock_mhz,
 )
 
 sys.stdout.reconfigure(encoding="utf-8")
@@ -50,7 +52,26 @@ check("EVIDENCE_SCHEMA_VERSION is a real version string", EVIDENCE_SCHEMA_VERSIO
 check("EVIDENCE_SNAPSHOT_PATH lives in DATA_DIR (unprivileged, no elevation needed to read it)",
       EVIDENCE_SNAPSHOT_PATH.name == "thermal_watch_evidence.json")
 check("snapshot interval is a positive, real number of ms", EVIDENCE_SNAPSHOT_INTERVAL_MS > 0)
+check("the first flush fires sooner than steady-state cadence (so the pipe's cache is populated "
+      "almost immediately after startup, not after a full interval)",
+      0 < EVIDENCE_SNAPSHOT_FIRST_FLUSH_MS <= EVIDENCE_SNAPSHOT_INTERVAL_MS)
 check("recent window is 24h", EVIDENCE_RECENT_WINDOW_S == 24 * 3600)
+check("CPU effective clock prefers the stable LHM identifier",
+      cpu_effective_clock_mhz([
+          {"Identifier": "/amdcpu/0/clock/2", "Name": "renamed", "SensorType": "Clock",
+           "Value": 623, "Parent": "Cpu AMD Ryzen 9 9950X"},
+          {"Name": "Cores (Average Effective)", "SensorType": "Clock", "Value": 111,
+           "Parent": "Cpu AMD Ryzen 9 9950X"},
+      ]) == 623)
+check("CPU effective clock permits the exact-name fallback when Identifier is absent",
+      cpu_effective_clock_mhz([{"Name": "Cores (Average Effective)", "SensorType": "Clock",
+                                "Value": 442, "Parent": "Cpu AMD Ryzen 9 9950X"}]) == 442)
+check("missing/null/zero CPU effective clocks remain unavailable",
+      all(cpu_effective_clock_mhz(sensors) is None for sensors in (
+          [],
+          [{"Identifier": "/amdcpu/0/clock/2", "Value": None}],
+          [{"Identifier": "/amdcpu/0/clock/2", "Value": 0}],
+      )))
 
 fresh_files()
 app = App()
@@ -78,6 +99,12 @@ try:
     check("generated_at is a real, recent timestamp", abs(snap["generated_at"] - time.time()) < 5)
     check("live network evidence exposes the already-computed top-process list",
           "top_processes" in snap["live"]["network"])
+    check("live CPU evidence adds only the optional effective-clock field",
+          set(snap["live"]["cpu"]) == {"temp_c", "load_pct", "power_w", "fan_rpm", "effective_clock_mhz"})
+    check("unavailable effective clock remains null", snap["live"]["cpu"]["effective_clock_mhz"] is None)
+    app.last_context["cpu_effective_clock_mhz"] = 623.0
+    check("available effective clock is copied into evidence in MHz",
+          app._build_evidence_snapshot()["live"]["cpu"]["effective_clock_mhz"] == 623.0)
 
     app.last_net_procs = {"capture_active": True, "capture_error": None, "top": [
         {"pid": 4242, "name": "fixture", "bytes_in": 5000, "bytes_out": 100,
@@ -186,6 +213,42 @@ try:
     app._flush_evidence_periodic()
     check("no snapshot written once stop_event is set - matches every other recurring flush's "
           "shutdown contract", not EVIDENCE_SNAPSHOT_PATH.exists())
+
+    print()
+    print("=" * 78)
+    print("10. _flush_evidence_periodic() also populates the pipe's cache, under the same "
+          "stop_event gate as the file write")
+    print("=" * 78)
+    app.stop_event.clear()
+    with app._evidence_cache_lock:
+        app._evidence_cache = None
+    app._flush_evidence_periodic()
+    check("_evidence_cache is populated by a normal flush", app._evidence_cache is not None)
+    check("the cached payload has the real schema version", app._evidence_cache.get("schema_version") == EVIDENCE_SCHEMA_VERSION)
+    on_disk_after = json.loads(EVIDENCE_SNAPSHOT_PATH.read_text(encoding="utf-8"))
+    check("the cache and the on-disk file came from the same build (both reflect the same "
+          "generated_at, not two separate _build_evidence_snapshot() calls)",
+          app._evidence_cache.get("generated_at") == on_disk_after.get("generated_at"))
+
+    with app._evidence_cache_lock:
+        app._evidence_cache = None
+    app.stop_event.set()
+    app._flush_evidence_periodic()
+    check("the cache also stays empty once stop_event is set - same shutdown gate as the file",
+          app._evidence_cache is None)
+
+    print()
+    print("=" * 78)
+    print("11. _write_evidence_snapshot(payload=...) writes exactly the given payload, not a "
+          "freshly rebuilt one")
+    print("=" * 78)
+    app.stop_event.clear()
+    fixed_payload = {"schema_version": EVIDENCE_SCHEMA_VERSION, "generated_at": 111.0, "marker": "explicit-payload"}
+    app._write_evidence_snapshot(payload=fixed_payload)
+    on_disk_fixed = json.loads(EVIDENCE_SNAPSHOT_PATH.read_text(encoding="utf-8"))
+    check("the file contains the exact payload passed in, not a rebuilt snapshot",
+          on_disk_fixed == fixed_payload, f"on disk: {on_disk_fixed}")
+    app.stop_event.set()
 finally:
     app.stop_event.set(); app.destroy()
 
