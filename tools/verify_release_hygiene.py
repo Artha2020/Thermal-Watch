@@ -42,7 +42,7 @@ check("public build has no hardcoded monitor wattage",
 check("cost assumptions are opt-in via environment",
       "THERMAL_WATCH_ELECTRICITY_RATE_MXN_PER_KWH" in app
       and "THERMAL_WATCH_MONITOR_ESTIMATED_WATTS" in app)
-check("README documents Intel Arc support", "Intel Arc GPU core temperature" in readme)
+check("all detected drive-temperature sensors are eligible for rendering", "disk_temps[:4]" not in app)\ncheck("README documents Intel Arc support", "Intel Arc GPU core temperature" in readme)
 check("README documents opt-in cost configuration", "Optional local cost assumptions" in readme)
 
 if failures:
