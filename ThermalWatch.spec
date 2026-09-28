@@ -5,7 +5,7 @@ a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=[],
-    datas=[('sensor_bridge.ps1', '.'), ('thermal_watch.ico', '.')],
+    datas=[('sensor_bridge_v3.ps1', '.'), ('sensor_snapshot.ps1', '.'), ('thermal_watch.ico', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
