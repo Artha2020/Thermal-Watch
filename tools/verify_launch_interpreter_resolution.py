@@ -49,14 +49,19 @@ def check(name, condition, detail=""):
 
 
 def find_real_pythonw():
-    """A real pythonw.exe on THIS machine, discovered dynamically - never hardcoded."""
-    found = shutil.which("pythonw")
-    if found:
-        return Path(found)
+    """A copyable real pythonw.exe on THIS machine, discovered dynamically - never hardcoded.
+
+    Prefer the sibling of sys.executable. Windows Store may expose an App Execution Alias named
+    pythonw.exe on PATH; shutil.which() can resolve that alias even though CopyFile2 cannot read it.
+    The sibling interpreter is the executable that actually belongs to the Python running this test.
+    """
     candidate = Path(sys.executable).with_name("pythonw.exe")
-    if candidate.exists():
+    if candidate.is_file():
         return candidate
-    raise RuntimeError("no real pythonw.exe could be discovered on this machine to copy for the test")
+    found = shutil.which("pythonw")
+    if found and Path(found).is_file():
+        return Path(found)
+    raise RuntimeError("no copyable real pythonw.exe could be discovered on this machine")
 
 
 def run_resolve(path_value):
