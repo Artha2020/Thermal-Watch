@@ -24,7 +24,7 @@ if ($MyInvocation.InvocationName -eq '.') {
 }
 
 $app = Join-Path $PSScriptRoot 'app.py'
-$appExe = Join-Path $PSScriptRoot 'dist\ThermalWatchSafe\ThermalWatch.exe'
+$appExe = Join-Path $PSScriptRoot 'dist\ThermalWatch\ThermalWatch.exe'
 $bridge = Join-Path $PSScriptRoot 'sensor_bridge_v3.ps1'
 $statusPath = Join-Path $env:ProgramData 'ThermalWatch\bridge_status_v3.json'
 
