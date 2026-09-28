@@ -29,6 +29,8 @@ check("launcher targets the PyInstaller output directory",
       "dist\\ThermalWatch\\ThermalWatch.exe" in launch)
 check("stale ThermalWatchSafe output path is absent",
       "ThermalWatchSafe" not in launch)
+check("launcher always selects exactly the first pythonw match",
+      "Select-Object -First 1" in launch)
 check("v3 bridge is packaged", "sensor_bridge_v3.ps1" in spec)
 check("sensor snapshot helper is packaged", "sensor_snapshot.ps1" in spec)
 check("unused PresentMon sampler is absent",
