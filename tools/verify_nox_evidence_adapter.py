@@ -27,7 +27,8 @@ snapshot = {
     "schema_version": "1.0", "generated_at": 1234.5,
     "system": {"cpu_model": "fixture CPU", "cpu_cores": 4, "cpu_threads": 8, "uptime_seconds": 99},
     "live": {
-        "cpu": {"temp_c": None, "load_pct": 12.0, "power_w": None, "fan_rpm": None},
+        "cpu": {"temp_c": None, "load_pct": 12.0, "power_w": None, "fan_rpm": None,
+                "effective_clock_mhz": 623.0},
         "gpu": {"core_temp_c": 55.0, "hotspot_temp_c": 65.0, "vram_temp_c": None,
                 "load_pct": 20.0, "power_w": 80.0, "vram_used_mb": 1000.0, "fan_pct": 30.0},
         "memory": {"used_pct": 25.0}, "bridge_health": "HEALTHY",
@@ -53,6 +54,8 @@ with tempfile.TemporaryDirectory(prefix="tw_nox_adapter_") as td:
         check("valid operation succeeds with Thermal Watch provenance",
               sensors["ok"] and sensors["provenance"]["authority"] == "Thermal Watch")
         check("unavailable sensor values remain null, never zero", sensors["data"]["cpu"]["temp_c"] is None)
+        check("additive CPU effective-clock evidence passes through unchanged",
+              sensors["data"]["cpu"]["effective_clock_mhz"] == 623.0)
         coverage = adapter.handle_request({"operation": "get_coverage"})
         check("incomplete monitoring coverage is preserved as monitoring_gap",
               coverage["evidence_status"] == "monitoring_gap" and coverage["data"]["coverage_pct"] == 50.0)
@@ -71,6 +74,14 @@ with tempfile.TemporaryDirectory(prefix="tw_nox_adapter_") as td:
               and incidents["evidence_status"] == sessions["evidence_status"] == "monitoring_gap")
         check("incident-local gap fields cannot be mistaken for evidence about unmonitored periods",
               "outside recorded incidents" in incidents["monitoring_limit"]["incident_monitoring_gap_seconds_scope"])
+        wide = adapter.handle_request({"operation": "get_recent_incidents", "parameters": {"days": 7}})
+        check("a days>1 request on the file-based CLI (no history_fetcher available here) degrades "
+              "honestly instead of silently answering from the narrower 24h snapshot",
+              wide["ok"] is False and wide["error"]["code"] == "history_unavailable")
+        experiments = adapter.handle_request({"operation": "get_experiments"})
+        check("get_experiments on the file-based CLI (no experiments_fetcher available here) also "
+              "degrades honestly - this operation has nothing in the snapshot to fall back to at all",
+              experiments["ok"] is False and experiments["error"]["code"] == "history_unavailable")
         check("unknown operation is rejected", not adapter.handle_request({"operation": "delete_evidence"})["ok"])
         hostile = ("path", "../secret", "C:\\secret", "command", "script", "sql", "mutation")
         for name in hostile:
