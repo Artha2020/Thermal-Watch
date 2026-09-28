@@ -396,6 +396,17 @@ def main():
         append_experiment(new_experiment_record(f"Change {i}", NOW - offset * DAY, "gpu", now=NOW,
                                                 existing_ids=[e["experiment_id"] for e in read_experiments_file()]))
     app = App()
+    # Isolate from ANY background recurring flush (evidence, active-incidents/sessions, ...) -
+    # this test's read-count assertion below must reflect only ExperimentsWindow's own I/O, not
+    # an unrelated periodic flush that happens to land during app.update()'s event-loop pump.
+    # Same pattern verify_evidence_api.py uses for the same reason.
+    for after_id in app.tk.eval("after info").split():
+        try:
+            command = app.tk.call("after", "info", after_id)[0]
+        except Exception:
+            continue
+        if any(str(command).endswith(name) for name in app._RECURRING_AFTER_METHODS):
+            app.after_cancel(after_id)
     counts = {"sessions": 0, "telemetry": 0, "experiments": 0}
     originals = (appmod.read_sessions_file, appmod.read_telemetry_file, appmod.read_experiments_file)
 

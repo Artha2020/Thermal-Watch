@@ -1,0 +1,51 @@
+name: Windows CI
+
+on:
+  push:
+    branches:
+      - main
+      - "release/**"
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade pip -r requirements-build.txt
+
+      - name: Compile Python sources
+        run: python -m compileall -q app.py ai thermal_watch_evidence_cli.py thermal_watch_evidence_pipe.py tools
+
+      - name: Public release hygiene
+        run: python tools/verify_release_hygiene.py
+
+      - name: AI tool discovery
+        run: python tools/verify_ai_tool_discovery.py
+
+      - name: Grounding guard
+        run: python tools/verify_grounding_guard.py
+
+      - name: Universal AI adapter
+        run: python tools/verify_universal_ai_adapter.py
+
+
+      - name: PyInstaller smoke build
+        run: python -m PyInstaller --clean --noconfirm ThermalWatch.spec

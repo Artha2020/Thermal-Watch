@@ -24,13 +24,13 @@ if ($MyInvocation.InvocationName -eq '.') {
 }
 
 $app = Join-Path $PSScriptRoot 'app.py'
-$bridge = Join-Path $PSScriptRoot 'sensor_bridge.ps1'
-$pythonw = Resolve-ThermalWatchPythonw
-$statusPath = Join-Path $env:ProgramData 'ThermalWatch\bridge_status.json'
+$appExe = Join-Path $PSScriptRoot 'dist\ThermalWatch\ThermalWatch.exe'
+$bridge = Join-Path $PSScriptRoot 'sensor_bridge_v3.ps1'
+$statusPath = Join-Path $env:ProgramData 'ThermalWatch\bridge_status_v3.json'
 
 # Cheap, UNELEVATED health check - reading ProgramData and querying whether a PID exists needs
 # no privilege. Used purely to decide whether to bother the user with a UAC prompt at all; the
-# bridge's own named mutex (see sensor_bridge.ps1) remains the actual race-free guarantee against
+# bridge's own named mutex (see sensor_bridge_v3.ps1) remains the actual race-free guarantee against
 # duplicate instances regardless of what this check concludes.
 function Test-BridgeHealthy {
     if (-not (Test-Path -LiteralPath $statusPath)) { return $false }
@@ -39,10 +39,10 @@ function Test-BridgeHealthy {
     } catch {
         return $false
     }
-    if (-not $status.pid) { return $false }
+    if (-not $status.pid -or -not $status.last_poll_utc) { return $false }
     $proc = Get-Process -Id $status.pid -ErrorAction SilentlyContinue
     if (-not $proc) { return $false }
-    $ageSeconds = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - $status.last_poll_utc
+    $ageSeconds = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [int64]$status.last_poll_utc
     return $ageSeconds -lt 10
 }
 
@@ -50,7 +50,7 @@ function Test-BridgeHealthy {
 # prompt entirely if a healthy bridge is already running (session-persistent by design - see
 # app.py's App.close() docstring - so this is the common case on every launch after the first).
 if (Test-BridgeHealthy) {
-    Write-Output "Sensor bridge already healthy, skipping elevation."
+    Write-Output "Sensor bridge healthy, skipping elevation."
 } else {
     Start-Process -FilePath 'powershell.exe' `
         -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $bridge) `
@@ -60,4 +60,9 @@ if (Test-BridgeHealthy) {
     Start-Sleep -Milliseconds 800
 }
 
-Start-Process -FilePath $pythonw -ArgumentList ('"{0}"' -f $app) -WorkingDirectory $PSScriptRoot
+if (Test-Path -LiteralPath $appExe) {
+    Start-Process -FilePath $appExe -WorkingDirectory (Split-Path $appExe)
+} else {
+    $pythonw = Resolve-ThermalWatchPythonw
+    Start-Process -FilePath $pythonw -ArgumentList ('"{0}"' -f $app) -WorkingDirectory $PSScriptRoot
+}

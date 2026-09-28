@@ -13,7 +13,10 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import tkinter as tk
+import urllib.error
+import urllib.request
 from collections import deque
 from ctypes import wintypes
 from datetime import datetime, date, timedelta
@@ -26,6 +29,13 @@ from tkinter import filedialog, ttk
 from ai import ai_settings
 from ai.provider_contract import ProviderContractError, ProviderResponse
 from ai.provider_registry import UniversalAIAdapter
+
+# Phase 12 - Evidence pipe. thermal_watch_evidence_cli.py's handle_request()/describe_operation_
+# catalog() are transport-agnostic (loader-injected); the named-pipe server below reuses them
+# unchanged against a live cached snapshot instead of the on-disk file. See both modules'
+# docstrings for the full design.
+import thermal_watch_evidence_cli as evidence_cli
+from thermal_watch_evidence_pipe import EvidencePipeServer
 
 # ---------------------------------------------------------------------------
 # Theme
@@ -138,6 +148,31 @@ RAM_ZONES = [
     (55.0, "YELLOW", AMBER, "WARM"),
     (0.0, "GREEN", GREEN, "NOMINAL"),
 ]
+
+# Utilization (percentage) zones for the USAGE tab - deliberately separate from the temperature
+# zones above (CPU_ZONES etc.), same (floor, key, color, label) shape so zone_for() works
+# unchanged. Thresholds match the USAGE tab's own design spec.
+CPU_LOAD_ZONES = [
+    (90.0, "CRIT", RED, "CRITICAL"),
+    (70.0, "WARN", AMBER, "WARN"),
+    (0.0, "OK", GREEN, "NOMINAL"),
+]
+MEM_LOAD_ZONES = [
+    (90.0, "CRIT", RED, "CRITICAL"),
+    (75.0, "WARN", AMBER, "WARN"),
+    (0.0, "OK", GREEN, "NOMINAL"),
+]
+DISK_ACTIVITY_ZONES = [
+    (90.0, "CRIT", RED, "CRITICAL"),
+    (70.0, "WARN", AMBER, "WARN"),
+    (0.0, "OK", GREEN, "NOMINAL"),
+]
+GPU_LOAD_ZONES = [
+    (95.0, "CRIT", RED, "CRITICAL"),
+    (80.0, "WARN", AMBER, "WARN"),
+    (0.0, "OK", GREEN, "NOMINAL"),
+]
+
 ZONE_SEVERITY = {"GREEN": 0, "YELLOW": 1, "ORANGE": 2, "RED": 3}  # generic; used only by zone_for() below
 ALERT_DEBOUNCE_S = 3.0  # generic; used only by the new per-sensor engine below
 
@@ -201,6 +236,27 @@ def sensor_identity(sensor):
     return (sensor.get("Parent", ""), sensor.get("Name", ""), sensor.get("SensorType", ""))
 
 
+CPU_EFFECTIVE_CLOCK_IDENTIFIER = "/amdcpu/0/clock/2"
+CPU_EFFECTIVE_CLOCK_NAME = "Cores (Average Effective)"
+
+
+def cpu_effective_clock_mhz(sensors):
+    """Return LHM's effective-average CPU clock, preferring its stable identifier."""
+    exact = next((s for s in sensors if s.get("Identifier") == CPU_EFFECTIVE_CLOCK_IDENTIFIER), None)
+    fallback = next((s for s in sensors
+                     if not s.get("Identifier")
+                     and s.get("SensorType") == "Clock"
+                     and s.get("Name") == CPU_EFFECTIVE_CLOCK_NAME
+                     and "cpu" in s.get("Parent", "").lower()), None)
+    sensor = exact or fallback
+    value = sensor.get("Value") if sensor else None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
 HISTORY_SECONDS = 24 * 3600
 POLL_SECONDS = 2
 MAX_SAMPLES = HISTORY_SECONDS // POLL_SECONDS
@@ -240,7 +296,14 @@ RANGES = [("15M", 15 * 60), ("1H", 3600), ("6H", 6 * 3600), ("24H", 24 * 3600)]
 # are the standard way to detect and correct for that. For a normal `python app.py` launch
 # (sys.frozen unset), this is exactly Path(__file__).parent - unchanged from before.
 _APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
-DATA_DIR = Path(os.environ.get("THERMAL_WATCH_DATA_DIR") or _APP_DIR).resolve()
+# Keep persistent history outside the replaceable PyInstaller build folder. In the standard
+# project layout (...\dist\ThermalWatch\ThermalWatch.exe), the stable project root is two
+# parents above the executable directory. An explicit THERMAL_WATCH_DATA_DIR still wins.
+if getattr(sys, "frozen", False) and _APP_DIR.parent.name.lower() == "dist":
+    _DEFAULT_DATA_DIR = _APP_DIR.parent.parent
+else:
+    _DEFAULT_DATA_DIR = _APP_DIR
+DATA_DIR = Path(os.environ.get("THERMAL_WATCH_DATA_DIR") or _DEFAULT_DATA_DIR).resolve()
 
 
 def data_path(filename):
@@ -473,6 +536,33 @@ def _new_session_record(key, display_name, pid, start_ts):
 # ---------------------------------------------------------------------------
 TELEMETRY_BUCKET_SECONDS = 60
 TELEMETRY_RETENTION_DAYS = 30
+# compute_totals_summary()'s window - matches TELEMETRY_RETENTION_DAYS/INCIDENT_RETENTION_DAYS/
+# SESSION_RETENTION_DAYS exactly (every store here shares one retention policy), not a separate
+# number invented for the totals row. TOTALS_REFRESH_INTERVAL_MS/TOTALS_FIRST_REFRESH_MS are
+# defined later, alongside EVIDENCE_SNAPSHOT_INTERVAL_MS/EVIDENCE_SNAPSHOT_FIRST_FLUSH_MS which
+# they reuse - module-level constants evaluate top-to-bottom, so they can't be defined here yet.
+TOTALS_WINDOW_DAYS = 30
+def _optional_positive_env_float(name):
+    """Return a positive float from the environment, or None when unset/invalid.
+
+    Cost and external-monitor estimates are user-specific assumptions, not measured telemetry.
+    Public builds therefore ship with no default estimate instead of embedding one machine's bill
+    or display wattage. Set the documented THERMAL_WATCH_* variables to opt in.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+ELECTRICITY_RATE_MXN_PER_KWH = _optional_positive_env_float(
+    "THERMAL_WATCH_ELECTRICITY_RATE_MXN_PER_KWH")
+MONITOR_ESTIMATED_WATTS = _optional_positive_env_float(
+    "THERMAL_WATCH_MONITOR_ESTIMATED_WATTS")
 # JSONL was Storage v1 (see the prior task). Storage v2 moves to SQLite for indexed
 # timestamp/sensor range queries - TELEMETRY_JSONL_PATH now names only the legacy file a
 # fresh SQLite store migrates from once, on first startup after upgrading; nothing live ever
@@ -488,13 +578,14 @@ TELEMETRY_GAP_BUCKETS = 3
 # collected into last_context for Cross-Sensor Diagnostics' live-only checks - this is the first
 # phase that actually PERSISTS them, which is what lets fan-speed-vs-temperature be correlated
 # from real accumulated history instead of the current live moment alone.
-TELEMETRY_SCALAR_KEYS = ("cpu_temp", "cpu_util", "cpu_power", "gpu_core_temp", "gpu_hotspot_temp",
+TELEMETRY_SCALAR_KEYS = ("cpu_temp", "cpu_util", "cpu_power", "gpu_core_temp", "arc_core_temp", "gpu_hotspot_temp",
                         "gpu_vram_temp", "gpu_util", "gpu_power", "gpu_vram_used_mb", "mem_pct",
                         "cpu_fan_rpm", "gpu_fan_pct", "net_down_mbps", "net_up_mbps",
                         "net_rx_bytes", "net_tx_bytes")
 TELEMETRY_SCALAR_CONTEXT_MAP = {
     "cpu_temp": "cpu_temp", "cpu_util": "cpu_load", "cpu_power": "cpu_power",
-    "gpu_core_temp": "gpu_core_temp", "gpu_hotspot_temp": "gpu_hotspot_temp", "gpu_vram_temp": "gpu_vram_temp",
+    "gpu_core_temp": "gpu_core_temp", "arc_core_temp": "arc_core_temp",
+    "gpu_hotspot_temp": "gpu_hotspot_temp", "gpu_vram_temp": "gpu_vram_temp",
     "gpu_util": "gpu_load", "gpu_power": "gpu_power", "gpu_vram_used_mb": "gpu_vram_used_mb", "mem_pct": "mem_pct",
     "cpu_fan_rpm": "cpu_fan_rpm", "gpu_fan_pct": "gpu_fan_pct",
     "net_down_mbps": "net_down_mbps", "net_up_mbps": "net_up_mbps",
@@ -505,7 +596,8 @@ TELEMETRY_SCALAR_CONTEXT_MAP = {
 # avg/max/min chart-line semantics (item 8: "for temperature sensors, allow average/maximum").
 TELEMETRY_SCALAR_LABELS = {
     "cpu_temp": ("CPU Package", "°C", True), "cpu_util": ("CPU Utilization", "%", False),
-    "cpu_power": ("CPU Power", "W", False), "gpu_core_temp": ("GPU Core", "°C", True),
+    "cpu_power": ("CPU Power", "W", False), "gpu_core_temp": ("RTX 3090 Core", "°C", True),
+    "arc_core_temp": ("Arc Pro B60 Core", "°C", True),
     "gpu_hotspot_temp": ("GPU Hotspot", "°C", True), "gpu_vram_temp": ("GPU Memory Junction", "°C", True),
     "gpu_util": ("GPU Utilization", "%", False), "gpu_power": ("GPU Power", "W", False),
     "gpu_vram_used_mb": ("GPU VRAM Used", "MB", False), "mem_pct": ("System RAM Usage", "%", False),
@@ -533,7 +625,8 @@ TELEMETRY_SCALAR_LABELS = {
 # matching (item 9) - drive/RAM per-sensor entries map via their own component string directly
 # (drive -> "drive", dimm -> "ram"), so only the scalar keys need an explicit table here.
 TELEMETRY_SCALAR_INCIDENT_COMPONENT = {
-    "cpu_temp": "cpu", "gpu_core_temp": "gpu_core", "gpu_hotspot_temp": "gpu_hotspot", "gpu_vram_temp": "gpu_vram",
+    "cpu_temp": "cpu", "gpu_core_temp": "gpu_core", "arc_core_temp": "arc_core",
+    "gpu_hotspot_temp": "gpu_hotspot", "gpu_vram_temp": "gpu_vram",
 }
 
 
@@ -879,6 +972,102 @@ def compute_coverage(buckets, window_seconds, bucket_seconds=TELEMETRY_BUCKET_SE
     return valid, expected, pct
 
 
+def compute_totals_summary(now=None, window_days=30):
+    """Everything Thermal Watch can honestly total up over its own retention window - there is no
+    lifetime/since-install counter anywhere in this app, every store (telemetry, incidents,
+    sessions) shares the same rolling retention policy, so a "total" here means "over the last
+    window_days", not "ever". Energy/data totals are reconstructed from telemetry bucket scalars
+    rather than a live accumulator that doesn't exist - reuses read_telemetry_file()/
+    read_incidents_file()/read_sessions_file()/compute_coverage() verbatim, no new aggregation
+    logic beyond summing what a bucket already recorded.
+
+    A total is None only when there is truly nothing to sum (zero buckets ever carried that
+    scalar) - the same "None means unavailable, never a fabricated 0" rule fmt_net_bytes already
+    holds to. A real 0.0 (genuinely monitored, genuinely no traffic or power draw) is a real
+    answer, not a gap, and stays 0.0."""
+    now = now if now is not None else time.time()
+    window_seconds = window_days * 86400
+    cutoff = now - window_seconds
+    buckets = read_telemetry_file(since_ts=cutoff)
+
+    energy_wh = None
+    if any("cpu_power" in b["scalars"] or "gpu_power" in b["scalars"] for b in buckets):
+        energy_wh = 0.0
+        for b in buckets:
+            end_ts = b.get("end_timestamp")
+            if end_ts is None:
+                continue
+            duration_h = (end_ts - b["start_timestamp"]) / 3600.0
+            if duration_h <= 0:
+                continue
+            cpu_w = (b["scalars"].get("cpu_power") or {}).get("avg")
+            gpu_w = (b["scalars"].get("gpu_power") or {}).get("avg")
+            energy_wh += ((cpu_w or 0.0) + (gpu_w or 0.0)) * duration_h
+
+    def _byte_total(scalar_key):
+        # Monotonic counters: a bucket's min is its first observed value, max is its last (see
+        # TELEMETRY_SCALAR_LABELS' own comment on this exact pair). max(0.0, ...) mirrors
+        # poll_network_state()'s own clamp for the identical "counter appears to have gone
+        # backwards" case (an adapter/driver reset between samples), rather than inventing a
+        # second reset-handling rule.
+        if not any(scalar_key in b["scalars"] for b in buckets):
+            return None
+        total = 0.0
+        for b in buckets:
+            s = b["scalars"].get(scalar_key)
+            if not s or s.get("min") is None or s.get("max") is None:
+                continue
+            total += max(0.0, s["max"] - s["min"])
+        return total
+
+    down_bytes = _byte_total("net_rx_bytes")
+    up_bytes = _byte_total("net_tx_bytes")
+
+    valid_buckets, _, _ = compute_coverage(buckets, window_seconds)
+    incident_count = len([i for i in read_incidents_file() if i.get("end_timestamp", 0) >= cutoff])
+    session_count = len([s for s in read_sessions_file() if s.get("end_timestamp", 0) >= cutoff])
+
+    energy_cost_mxn = (
+        None if energy_wh is None or ELECTRICITY_RATE_MXN_PER_KWH is None
+        else (energy_wh / 1000.0) * ELECTRICITY_RATE_MXN_PER_KWH
+    )
+    monitor_energy_wh = (
+        None if MONITOR_ESTIMATED_WATTS is None
+        else MONITOR_ESTIMATED_WATTS * window_days * 24.0
+    )
+    monitor_energy_cost_mxn = (
+        None if monitor_energy_wh is None or ELECTRICITY_RATE_MXN_PER_KWH is None
+        else (monitor_energy_wh / 1000.0) * ELECTRICITY_RATE_MXN_PER_KWH
+    )
+
+    return {
+        "window_days": window_days,
+        "energy_wh": energy_wh,
+        # Raw bytes, not pre-converted to GB - formatted at display time via fmt_net_bytes(),
+        # the same helper the network panel's own TOTAL RX/TX cells already use, so a small
+        # window shows KB/MB rather than "0.00 GB".
+        "down_bytes": down_bytes,
+        "up_bytes": up_bytes,
+        "monitored_seconds": valid_buckets * TELEMETRY_BUCKET_SECONDS,
+        "incident_count": incident_count,
+        "session_count": session_count,
+        # None whenever telemetry is missing OR the user has not configured a local electricity
+        # rate; public builds never borrow somebody else's tariff.
+        "energy_cost_mxn": energy_cost_mxn,
+        # Optional user assumption, not a measurement. None when no external-display wattage was
+        # configured; kept separate from real sensor-derived PC energy/cost.
+        "monitor_energy_wh": monitor_energy_wh,
+        "monitor_energy_cost_mxn": monitor_energy_cost_mxn,
+        # None whenever energy_cost_mxn is - a "combined" total that silently dropped the PC's
+        # real (possibly-unmeasured) share and presented monitor-only as if it were everything
+        # would be exactly the kind of quietly-wrong number this app never allows.
+        "combined_cost_mxn": (
+            None if energy_cost_mxn is None or monitor_energy_cost_mxn is None
+            else energy_cost_mxn + monitor_energy_cost_mxn
+        ),
+    }
+
+
 def extract_bucket_metric(bucket, sensor_ref):
     """One bucket -> that sensor's {'avg','min','max','count'} for this bucket, or None if this
     sensor had no data this bucket. sensor_ref is {'kind': 'scalar'|'sensor', 'key': ...} -
@@ -976,17 +1165,23 @@ def overlapping_sessions(sessions, start_ts, end_ts, workload_key=None):
 # engine (item 12) so it's testable with plain dicts and no Tk/file-dialog involved.
 # ---------------------------------------------------------------------------
 EXPORT_SCHEMA_VERSION = "1.0"
-APP_VERSION = "1.1.0"  # single source of truth for the app's release version - the header label
+APP_VERSION = "1.1.1"  # single source of truth for the app's release version - the header label
                         # derives its displayed "vX.Y.Z" from this constant rather than a second
                         # hardcoded literal, so the two can never silently drift apart again
 
 # ---------------------------------------------------------------------------
-# Evidence API (v1.1 Phase 10) - "Thermal Watch remains the evidence engine; Nox, or any other
-# AI, can query it." File-based, not a network service: Thermal Watch periodically writes a
-# structured snapshot to a known local path (same atomic tmp-then-replace pattern as every other
-# store here), and any process that can read a file - Nox, a script, a human - can consume it.
-# No listening socket, no new attack surface, no dependency on an AI being configured or even
-# running; Thermal Watch writes this whether or not anything ever reads it.
+# Evidence API (v1.1 Phase 10; local pipe added Phase 12) - "Thermal Watch remains the evidence
+# engine; Nox, or any other AI, can query it." Two channels now exist, both sourced from the same
+# periodically-built snapshot. (1) A file, written atomically (tmp-then-replace) to a known local
+# path on the same cadence as before - any process that can read a file, including Nox, a script,
+# or a human, can still consume it exactly as it always could. (2) A local-only named pipe
+# (thermal_watch_evidence_pipe.py) that Nox now uses instead: connecting to a nonexistent pipe
+# fails immediately and unambiguously, which a stale-but-present file cannot signal - that gap is
+# precisely what caused a real incident where Nox kept serving several-minutes-stale evidence as
+# if it were live because nothing distinguished "no update in a while" from "the writer is gone."
+# The pipe IS a new listening surface, so "no listening socket" is no longer accurate - the
+# mitigation is PIPE_REJECT_REMOTE_CLIENTS, which closes the only network-reachable path
+# (\\hostname\pipe\... over SMB) and keeps it local-machine-only, same threat model as the file.
 #
 # Every section is assembled from ALREADY-COMPUTED state or an already-existing read function -
 # no new aggregation logic, no new causal language. This is the same "AI owns explanation,
@@ -1001,7 +1196,19 @@ EVIDENCE_SNAPSHOT_PATH = data_path("thermal_watch_evidence.json")
 # Same cadence as the active-incident/session flush timers - live enough to be useful to an AI
 # polling it, not so frequent that a modest JSON write competes with the 2s sensor poll.
 EVIDENCE_SNAPSHOT_INTERVAL_MS = ACTIVE_INCIDENTS_FLUSH_INTERVAL_MS
+# Only the very first flush after startup uses this shorter delay, so the pipe's cache (see
+# _pipe_evidence_loader) is populated almost immediately rather than leaving Nox's first request
+# waiting out a full EVIDENCE_SNAPSHOT_INTERVAL_MS; every later tick uses the normal cadence.
+EVIDENCE_SNAPSHOT_FIRST_FLUSH_MS = 100
 EVIDENCE_RECENT_WINDOW_S = 24 * 3600  # "recent" incidents/sessions included verbatim = last 24h
+EVIDENCE_PIPE_ENABLED = True  # rollback lever - flip False to disable the pipe server entirely
+                               # without touching anything else if the frozen build misbehaves
+
+# Totals strip (see compute_totals_summary()/TOTALS_WINDOW_DAYS above) - same cadence reasoning
+# as the evidence snapshot flush: live enough to be useful, not so frequent that a real
+# telemetry-file scan (heavier than a single sensor poll) competes with the 2s poll loop.
+TOTALS_REFRESH_INTERVAL_MS = EVIDENCE_SNAPSHOT_INTERVAL_MS
+TOTALS_FIRST_REFRESH_MS = EVIDENCE_SNAPSHOT_FIRST_FLUSH_MS
 
 CSV_DIRECT_FIELDS = [
     "incident_id", "start_timestamp", "end_timestamp", "duration_seconds", "duration_exact",
@@ -4743,7 +4950,47 @@ def memory():
 # the same process-name/PID/window-title/utilization metadata Task Manager itself shows.
 # ---------------------------------------------------------------------------
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+PROCESS_VM_READ = 0x0010
 LOGICAL_CPU_COUNT = os.cpu_count() or 1
+
+
+class IO_COUNTERS(ctypes.Structure):
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_uint64),
+        ("WriteOperationCount", ctypes.c_uint64),
+        ("OtherOperationCount", ctypes.c_uint64),
+        ("ReadTransferCount", ctypes.c_uint64),
+        ("WriteTransferCount", ctypes.c_uint64),
+        ("OtherTransferCount", ctypes.c_uint64),
+    ]
+
+
+# Explicit argtypes/restype on both of these, unlike the immediately-surrounding CPU-time code -
+# this file's own lesson (see the network section's comment on the sleep/resume title-bar bug):
+# skipping this can silently misinterpret a 64-bit value, and both structs below are full of them.
+ctypes.windll.kernel32.GetProcessIoCounters.argtypes = [wintypes.HANDLE, ctypes.POINTER(IO_COUNTERS)]
+ctypes.windll.kernel32.GetProcessIoCounters.restype = wintypes.BOOL
+
+
+class PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
+    _fields_ = [
+        ("cb", wintypes.DWORD),
+        ("PageFaultCount", wintypes.DWORD),
+        ("PeakWorkingSetSize", ctypes.c_size_t),
+        ("WorkingSetSize", ctypes.c_size_t),
+        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+        ("PagefileUsage", ctypes.c_size_t),
+        ("PeakPagefileUsage", ctypes.c_size_t),
+        ("PrivateUsage", ctypes.c_size_t),
+    ]
+
+
+ctypes.windll.psapi.GetProcessMemoryInfo.argtypes = [
+    wintypes.HANDLE, ctypes.POINTER(PROCESS_MEMORY_COUNTERS_EX), wintypes.DWORD]
+ctypes.windll.psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
 
 
 def _enum_pids():
@@ -4793,8 +5040,14 @@ def foreground_process():
     return {"name": name or f"pid:{pid.value}", "pid": pid.value, "title": title}
 
 
-def _sample_process_cpu_times():
-    """{pid: (name, kernel+user 100ns total)} for every process we can open/query."""
+def _sample_process_stats():
+    """{pid: (name, kernel+user 100ns total, disk_read_bytes, disk_write_bytes)} for every
+    process we can open/query. disk_read_bytes/disk_write_bytes are cumulative since process
+    start (same convention as the CPU time field) and None if GetProcessIoCounters failed for
+    this pid even though GetProcessTimes succeeded - never a fabricated 0. GetProcessIoCounters
+    needs no wider access right than GetProcessTimes already does, so this single
+    OpenProcess/enumeration pass now feeds both CPU and disk sampling - see
+    _sample_process_memory() for the deliberately separate, wider-permission memory pass."""
     out = {}
     for pid in _enum_pids():
         h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
@@ -4809,7 +5062,37 @@ def _sample_process_cpu_times():
             if ctypes.windll.kernel32.GetProcessTimes(h, ctypes.byref(creation), ctypes.byref(exit_t),
                                                        ctypes.byref(kernel), ctypes.byref(user)):
                 val = lambda t: (t.dwHighDateTime << 32) | t.dwLowDateTime
-                out[pid] = (name, val(kernel) + val(user))
+                cpu_100ns = val(kernel) + val(user)
+                io = IO_COUNTERS()
+                read_b = write_b = None
+                if ctypes.windll.kernel32.GetProcessIoCounters(h, ctypes.byref(io)):
+                    read_b, write_b = io.ReadTransferCount, io.WriteTransferCount
+                out[pid] = (name, cpu_100ns, read_b, write_b)
+        finally:
+            ctypes.windll.kernel32.CloseHandle(h)
+    return out
+
+
+def _sample_process_memory(pids):
+    """{pid: working_set_bytes} for as many of the given pids as we can open with
+    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ - a WIDER handle than
+    _sample_process_stats() needs for CPU/disk. Deliberately its own OpenProcess pass (never
+    reuses _sample_process_stats()'s handle) so a process we can't get VM_READ for (e.g. an
+    elevated peer process, even though PROCESS_QUERY_LIMITED_INFORMATION alone succeeded for it)
+    only loses its memory reading - it never disappears from cpu_top/gpu_top. Called only with
+    the pids that already made the Apps tab's top-N cut, so cost is O(top_n), not O(all
+    processes). A pid absent from the returned dict means "memory not obtainable", never a
+    fabricated 0."""
+    out = {}
+    for pid in pids:
+        h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, False, pid)
+        if not h:
+            continue
+        try:
+            counters = PROCESS_MEMORY_COUNTERS_EX()
+            counters.cb = ctypes.sizeof(counters)
+            if ctypes.windll.psapi.GetProcessMemoryInfo(h, ctypes.byref(counters), counters.cb):
+                out[pid] = counters.WorkingSetSize
         finally:
             ctypes.windll.kernel32.CloseHandle(h)
     return out
@@ -4823,7 +5106,7 @@ def cpu_top_processes(prev_times, curr_times, dt_seconds, top_n=5):
     if dt_seconds <= 0:
         return []
     out = []
-    for pid, (name, cpu_now) in curr_times.items():
+    for pid, (name, cpu_now, *_rest) in curr_times.items():
         prev = prev_times.get(pid)
         if not prev:
             continue
@@ -4857,6 +5140,7 @@ class GpuProcessSampler:
         self.ok = False
         self.query = ctypes.c_void_p()
         self.counter_pid = {}  # counter handle (as int) -> pid
+        self.counter_engtype = {}  # counter handle (as int) -> engine type string, e.g. "3D"
         self._samples_since_expand = 0
         try:
             if ctypes.windll.pdh.PdhOpenQueryW(None, 0, ctypes.byref(self.query)) == 0:
@@ -4881,6 +5165,7 @@ class GpuProcessSampler:
             pass
         self.query = ctypes.c_void_p()
         self.counter_pid = {}
+        self.counter_engtype = {}
         if ctypes.windll.pdh.PdhOpenQueryW(None, 0, ctypes.byref(self.query)) != 0:
             # Couldn't reopen: leave the query null and _samples_since_expand past its threshold
             # so the next sample() retries. sample()'s PdhCollectQueryData on a null query fails
@@ -4904,6 +5189,13 @@ class GpuProcessSampler:
             handle = ctypes.c_void_p()
             if ctypes.windll.pdh.PdhAddCounterW(self.query, counter_path, 0, ctypes.byref(handle)) == 0:
                 self.counter_pid[handle.value] = int(m.group(1))
+                # engtype_* is a driver-defined suffix on the same counter path (e.g.
+                # "...eng_2_engtype_3D") - USAGE tab's per-engine breakdown; absent on drivers
+                # that don't expose it, in which case that counter just never appears in
+                # sample_by_engine()'s result, same "not obtainable" contract as everywhere else.
+                m_eng = re.search(r"engtype_(\w+)", counter_path)
+                if m_eng:
+                    self.counter_engtype[handle.value] = m_eng.group(1)
         # Prime the rebuilt query. \GPU Engine(*)\Utilization Percentage is a RATE counter: it
         # needs two collections before it can yield a value, so the first sample() after every
         # rebuild returned {} - measured at 100% of post-rebuild polls, i.e. one poll in five
@@ -4913,27 +5205,254 @@ class GpuProcessSampler:
         ctypes.windll.pdh.PdhCollectQueryData(self.query)
         self._samples_since_expand = 0
 
-    def sample(self):
-        """{pid: max_engine_utilization_percent}, or {} if unavailable this poll (never
-        invents a value - callers must treat an empty result as 'not obtainable', per spec)."""
+    def collect(self):
+        """Call exactly once per tick, before sample_by_pid()/sample_by_engine() - both read
+        the SAME collection, since PdhCollectQueryData is not idempotent within a tick (calling
+        it twice would silently give a second, shorter interval to whichever call went second).
+        Returns False if unavailable this poll (never invents a value); callers should treat
+        that as 'skip both readers this tick', same contract the old combined sample() had."""
         if not self.ok:
-            return {}
+            return False
         try:
             if self._samples_since_expand >= self.REEXPAND_EVERY_N_SAMPLES:
                 self._expand()
             if ctypes.windll.pdh.PdhCollectQueryData(self.query) != 0:
-                return {}
+                return False
             self._samples_since_expand += 1
-            result = {}
-            for handle_val, pid in self.counter_pid.items():
+            return True
+        except OSError:
+            return False
+
+    def sample_by_pid(self):
+        """{pid: max_engine_utilization_percent} from the most recent collect(). Unchanged
+        contract/shape from the old combined sample()."""
+        result = {}
+        for handle_val, pid in self.counter_pid.items():
+            fmt = PDH_FMT_VALUE()
+            status = ctypes.windll.pdh.PdhGetFormattedCounterValue(
+                ctypes.c_void_p(handle_val), self.PDH_FMT_DOUBLE, None, ctypes.byref(fmt))
+            if status == 0 and fmt.CStatus == 0 and fmt.doubleValue > 0:
+                result[pid] = max(result.get(pid, 0.0), fmt.doubleValue)
+        return result
+
+    def sample_by_engine(self):
+        """{engine_type: summed_utilization_percent_across_all_processes} from the most recent
+        collect(). SUM, not max: unlike a single process's own concurrent engines (independent
+        pipelines it may use at once, so max is the conservative per-process reading - see class
+        docstring), a per-engine-type SYSTEM total is additive across the processes sharing that
+        engine - two processes each drawing 40% of the 3D engine really is 80% total, not 40%."""
+        result = {}
+        for handle_val, engtype in self.counter_engtype.items():
+            fmt = PDH_FMT_VALUE()
+            status = ctypes.windll.pdh.PdhGetFormattedCounterValue(
+                ctypes.c_void_p(handle_val), self.PDH_FMT_DOUBLE, None, ctypes.byref(fmt))
+            if status == 0 and fmt.CStatus == 0 and fmt.doubleValue > 0:
+                result[engtype] = result.get(engtype, 0.0) + fmt.doubleValue
+        return result
+
+
+class CpuCoreSampler:
+    """Long-lived PDH query against \\Processor(*)\\% Processor Time, one counter per logical
+    core - feeds the USAGE tab's per-core mini bar chart only (never the headline CPU% number,
+    which stays d['cpu_load'] from cpu_times()/GetSystemTimes as before). Unlike
+    GpuProcessSampler, the instance set is FIXED for the process's whole lifetime - logical
+    cores don't come and go the way GPU-using processes do - so this is built ONCE in __init__
+    and deliberately never re-expands; periodic rebuild would only add PdhCloseQuery/
+    PdhOpenQueryW/PdhAddCounterW churn with nothing to gain. The `_Total` pseudo-instance PDH
+    always includes alongside 0,1,2... is excluded automatically: its instance name is
+    non-numeric and never matches the digit-only parse regex below."""
+
+    PDH_FMT_DOUBLE = 0x00000200
+
+    def __init__(self):
+        self.ok = False
+        self.query = ctypes.c_void_p()
+        self.core_handles = {}  # logical core index -> counter handle (c_void_p)
+        try:
+            if ctypes.windll.pdh.PdhOpenQueryW(None, 0, ctypes.byref(self.query)) != 0:
+                return
+            path = r"\Processor(*)\% Processor Time"
+            size = ctypes.c_ulong(0)
+            ctypes.windll.pdh.PdhExpandWildCardPathW(None, path, None, ctypes.byref(size), 0)
+            if size.value == 0:
+                return
+            buf = ctypes.create_unicode_buffer(size.value)
+            if ctypes.windll.pdh.PdhExpandWildCardPathW(None, path, buf, ctypes.byref(size), 0) != 0:
+                return
+            raw = ctypes.wstring_at(buf, size.value)
+            for counter_path in [p for p in raw.split("\x00") if p]:
+                m = re.search(r"\\Processor\((\d+)\)\\", counter_path)
+                if not m:
+                    continue  # skips _Total
+                handle = ctypes.c_void_p()
+                if ctypes.windll.pdh.PdhAddCounterW(self.query, counter_path, 0, ctypes.byref(handle)) == 0:
+                    self.core_handles[int(m.group(1))] = handle
+            # Rate counter - needs two collections before it yields a value. Prime once here
+            # (same reasoning as GpuProcessSampler._expand()'s priming collect) so the first
+            # real sample() already has a valid interval.
+            ctypes.windll.pdh.PdhCollectQueryData(self.query)
+            self.ok = bool(self.core_handles)
+        except OSError:
+            self.ok = False
+
+    def sample(self):
+        """List of length (max core index + 1), ordered by core index, each entry a 0-100
+        float or None if that core's read failed this poll. [] if the sampler itself is
+        unavailable - never invents a value, same contract as GpuProcessSampler."""
+        if not self.ok:
+            return []
+        try:
+            if ctypes.windll.pdh.PdhCollectQueryData(self.query) != 0:
+                return []
+            out = [None] * (max(self.core_handles) + 1)
+            for idx, handle in self.core_handles.items():
                 fmt = PDH_FMT_VALUE()
                 status = ctypes.windll.pdh.PdhGetFormattedCounterValue(
-                    ctypes.c_void_p(handle_val), self.PDH_FMT_DOUBLE, None, ctypes.byref(fmt))
-                if status == 0 and fmt.CStatus == 0 and fmt.doubleValue > 0:
-                    result[pid] = max(result.get(pid, 0.0), fmt.doubleValue)
-            return result
+                    handle, self.PDH_FMT_DOUBLE, None, ctypes.byref(fmt))
+                out[idx] = fmt.doubleValue if status == 0 and fmt.CStatus == 0 else None
+            return out
+        except OSError:
+            return []
+
+
+MEMORY_COMPOSITION_PATHS = {
+    "standby_normal": r"\Memory\Standby Cache Normal Priority Bytes",
+    "standby_reserve": r"\Memory\Standby Cache Reserve Bytes",
+    "standby_core": r"\Memory\Standby Cache Core Bytes",
+    "modified": r"\Memory\Modified Page List Bytes",
+    "free": r"\Memory\Free & Zero Page List Bytes",
+}
+
+
+class MemoryCompositionSampler:
+    """Fixed, single-instance \\Memory\\* byte-count gauges for the USAGE tab's memory
+    composition breakdown - no wildcard expansion (unlike GpuProcessSampler/CpuCoreSampler,
+    these are named, not instance-per-core/per-process), no re-expand cycle (the counter set
+    can never change), and no priming collect (these are instantaneous gauges, not rate
+    counters - a single PdhCollectQueryData right after PdhAddCounterW already yields a valid
+    value). Reuses PDH_FMT_VALUE/PDH_FMT_DOUBLE - a double's 52-bit mantissa is exact well past
+    any realistic RAM size in bytes, so no separate large-integer format is needed."""
+
+    PDH_FMT_DOUBLE = 0x00000200
+
+    def __init__(self):
+        self.ok = False
+        self.query = ctypes.c_void_p()
+        self.handles = {}
+        try:
+            if ctypes.windll.pdh.PdhOpenQueryW(None, 0, ctypes.byref(self.query)) != 0:
+                return
+            for key, path in MEMORY_COMPOSITION_PATHS.items():
+                handle = ctypes.c_void_p()
+                if ctypes.windll.pdh.PdhAddCounterW(self.query, path, 0, ctypes.byref(handle)) == 0:
+                    self.handles[key] = handle
+            self.ok = len(self.handles) == len(MEMORY_COMPOSITION_PATHS)
+        except OSError:
+            self.ok = False
+
+    def sample(self):
+        """{"standby_bytes":.., "modified_bytes":.., "free_bytes":..}, or {} if unavailable
+        this poll or any one of the underlying counters failed - never returns a PARTIAL
+        breakdown, since the USAGE tab derives "In Use" as a residual (total - the other
+        three) and a partial read would silently corrupt that residual."""
+        if not self.ok:
+            return {}
+        try:
+            if ctypes.windll.pdh.PdhCollectQueryData(self.query) != 0:
+                return {}
+            raw = {}
+            for key, handle in self.handles.items():
+                fmt = PDH_FMT_VALUE()
+                status = ctypes.windll.pdh.PdhGetFormattedCounterValue(
+                    handle, self.PDH_FMT_DOUBLE, None, ctypes.byref(fmt))
+                if status != 0 or fmt.CStatus != 0:
+                    return {}
+                raw[key] = fmt.doubleValue
+            standby = raw["standby_normal"] + raw["standby_reserve"] + raw["standby_core"]
+            return {"standby_bytes": standby, "modified_bytes": raw["modified"], "free_bytes": raw["free"]}
         except OSError:
             return {}
+
+
+class PhysicalDiskSampler:
+    """Long-lived PDH query against \\PhysicalDisk(*)\\% Disk Time for the USAGE tab's
+    per-drive activity breakdown - a 0-100(+)% busy proxy (can exceed 100 under deep NVMe
+    queuing; display the raw reading uncapped and clamp only a bar's fill ratio, matching
+    MetricCard's own "never clamp the reading, only the bar" convention). Re-expands on a slow
+    cadence (physical disks can hot-plug, but far less often than GPU-using processes churn -
+    REEXPAND_EVERY_N_SAMPLES=150 is ~5 minutes at POLL_SECONDS=2), same full-rebuild mechanics
+    as GpuProcessSampler._expand() for the same counter-leak reason."""
+
+    PDH_FMT_DOUBLE = 0x00000200
+    REEXPAND_EVERY_N_SAMPLES = 150
+
+    def __init__(self):
+        self.ok = False
+        self.query = ctypes.c_void_p()
+        self.disks = {}  # disk index -> {"handle": c_void_p, "label": "Disk 0 (C:)"}
+        self._samples_since_expand = 0
+        try:
+            if ctypes.windll.pdh.PdhOpenQueryW(None, 0, ctypes.byref(self.query)) == 0:
+                self._expand()
+                self.ok = True
+        except OSError:
+            self.ok = False
+
+    def _expand(self):
+        try:
+            if self.query:
+                ctypes.windll.pdh.PdhCloseQuery(self.query)
+        except OSError:
+            pass
+        self.query = ctypes.c_void_p()
+        self.disks = {}
+        if ctypes.windll.pdh.PdhOpenQueryW(None, 0, ctypes.byref(self.query)) != 0:
+            self.query = ctypes.c_void_p()
+            return
+        path = r"\PhysicalDisk(*)\% Disk Time"
+        size = ctypes.c_ulong(0)
+        ctypes.windll.pdh.PdhExpandWildCardPathW(None, path, None, ctypes.byref(size), 0)
+        if size.value == 0:
+            return
+        buf = ctypes.create_unicode_buffer(size.value)
+        if ctypes.windll.pdh.PdhExpandWildCardPathW(None, path, buf, ctypes.byref(size), 0) != 0:
+            return
+        raw = ctypes.wstring_at(buf, size.value)
+        for counter_path in [p for p in raw.split("\x00") if p]:
+            m = re.search(r"\\PhysicalDisk\((\d+)((?:\s+[A-Za-z]:)*)\)\\", counter_path)
+            if not m:
+                continue  # skips _Total (non-numeric)
+            disk_idx = int(m.group(1))
+            letters = m.group(2).strip()
+            label = f"Disk {disk_idx}" + (f" ({letters.replace(' ', '/')})" if letters else "")
+            handle = ctypes.c_void_p()
+            if ctypes.windll.pdh.PdhAddCounterW(self.query, counter_path, 0, ctypes.byref(handle)) == 0:
+                self.disks[disk_idx] = {"handle": handle, "label": label}
+        ctypes.windll.pdh.PdhCollectQueryData(self.query)  # prime - rate counter, see GpuProcessSampler
+        self._samples_since_expand = 0
+
+    def sample(self):
+        """[{"disk_idx":.., "label":.., "pct":..}, ...] sorted by disk_idx, or [] if
+        unavailable this poll - never invents a value."""
+        if not self.ok:
+            return []
+        try:
+            if self._samples_since_expand >= self.REEXPAND_EVERY_N_SAMPLES:
+                self._expand()
+            if ctypes.windll.pdh.PdhCollectQueryData(self.query) != 0:
+                return []
+            self._samples_since_expand += 1
+            out = []
+            for disk_idx, info in self.disks.items():
+                fmt = PDH_FMT_VALUE()
+                status = ctypes.windll.pdh.PdhGetFormattedCounterValue(
+                    info["handle"], self.PDH_FMT_DOUBLE, None, ctypes.byref(fmt))
+                if status == 0 and fmt.CStatus == 0:
+                    out.append({"disk_idx": disk_idx, "label": info["label"], "pct": fmt.doubleValue})
+            out.sort(key=lambda r: r["disk_idx"])
+            return out
+        except OSError:
+            return []
 
 
 def gpu_top_processes(pid_util, cpu_names_by_pid, top_n=5):
@@ -4949,6 +5468,45 @@ def gpu_top_processes(pid_util, cpu_names_by_pid, top_n=5):
         out.append((name, pid, min(100.0, pct)))
     out.sort(key=lambda x: -x[2])
     return out[:top_n]
+
+
+APPS_TAB_TOP_N = 20
+
+
+def build_apps_table(prev_times, curr_times, dt_seconds, gpu_util, top_n=APPS_TAB_TOP_N):
+    """Combines CPU%, disk I/O rate, GPU%, and (only for the resulting top_n pids) working-set
+    memory into one Task-Manager-style record list, sorted by CPU% descending. This is a WIDER,
+    differently-shaped top-N than cpu_top_processes()'s top-5 (used for alert/session workload
+    attribution) - deliberately a separate function/list so the Apps tab can never affect that
+    existing feature. Memory is sampled for only the pids that make this cut, so its cost is
+    O(top_n), independent of how many processes are running on the machine. Not floored at 0.5%
+    the way cpu_top_processes is - that floor exists so alert attribution never blames a barely-
+    active process; a literal process table should show the full ranked list, near-idle
+    processes included.
+    Returns [{"pid","name","cpu_pct","memory_bytes","disk_read_bps","disk_write_bps","gpu_pct"}],
+    with memory_bytes/disk_*_bps as None (never a fabricated 0) when not obtainable this tick."""
+    if dt_seconds <= 0:
+        return []
+    ranked = []
+    for pid, (name, cpu_now, read_now, write_now) in curr_times.items():
+        prev = prev_times.get(pid)
+        if not prev:
+            continue
+        _, cpu_prev, read_prev, write_prev = prev
+        delta_100ns = cpu_now - cpu_prev
+        cpu_pct = (delta_100ns / 1e7) / dt_seconds / LOGICAL_CPU_COUNT * 100 if delta_100ns > 0 else 0.0
+        disk_read_bps = (max(0.0, read_now - read_prev) / dt_seconds
+                          if read_now is not None and read_prev is not None else None)
+        disk_write_bps = (max(0.0, write_now - write_prev) / dt_seconds
+                           if write_now is not None and write_prev is not None else None)
+        ranked.append({"pid": pid, "name": name, "cpu_pct": cpu_pct, "disk_read_bps": disk_read_bps,
+                       "disk_write_bps": disk_write_bps, "gpu_pct": gpu_util.get(pid)})
+    ranked.sort(key=lambda r: -r["cpu_pct"])
+    top = ranked[:top_n]
+    mem_by_pid = _sample_process_memory([r["pid"] for r in top])
+    for r in top:
+        r["memory_bytes"] = mem_by_pid.get(r["pid"])
+    return top
 
 
 def hardware_info():
@@ -4973,6 +5531,225 @@ def nvidia_stats():
         result.append({"name": row[0].strip(), "temp": num(row[1]), "load": num(row[2]),
                        "mem_used": num(row[3]), "mem_total": num(row[4]), "clock": num(row[5]),
                        "power": num(row[6]), "power_limit": num(row[7]), "fan": num(row[8])})
+    return result
+
+
+def intel_gpu_stats_from_lhm(sensors):
+    """Translate LibreHardwareMonitor Intel-GPU sensors into the same lightweight
+    device records used by nvidia_stats(). Missing metrics stay None; no values are invented."""
+    groups = {}
+    for sensor in sensors or []:
+        parent = (sensor.get("Parent") or "").strip()
+        if not parent.lower().startswith("gpuintel "):
+            continue
+        groups.setdefault(parent, []).append(sensor)
+
+    result = []
+    for parent, rows in groups.items():
+        name = parent[len("GpuIntel "):].strip() or "Intel GPU"
+
+        def reading(sensor_type, sensor_name):
+            row = next((s for s in rows if s.get("SensorType") == sensor_type and s.get("Name") == sensor_name), None)
+            try:
+                return float(row["Value"]) if row and row.get("Value") is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        result.append({
+            "name": name, "vendor": "intel", "source": "lhm",
+            "temp": reading("Temperature", "GPU Core"), "load": None,
+            "mem_used": None, "mem_total": None, "clock": reading("Clock", "GPU Core"),
+            "memory_clock": reading("Clock", "GPU Memory"),
+            "power": reading("Power", "GPU Package"), "power_limit": None,
+            "fan": None, "fan_rpm": reading("Fan", "GPU Fan"),
+            "voltage": reading("Voltage", "GPU Core"),
+        })
+    return result
+
+
+class _D3DKMT_LUID(ctypes.Structure):
+    _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+
+
+class _D3DKMTAdapterInfo(ctypes.Structure):
+    _fields_ = [("hAdapter", wintypes.UINT),
+                ("AdapterLuid", _D3DKMT_LUID),
+                ("NumOfSources", wintypes.ULONG),
+                ("bPrecisePresentRegionsPreferred", wintypes.BOOL)]
+
+
+class _D3DKMTEnumAdapters2(ctypes.Structure):
+    _fields_ = [("NumAdapters", wintypes.ULONG),
+                ("pAdapters", ctypes.POINTER(_D3DKMTAdapterInfo))]
+
+
+class _D3DKMTQueryAdapterInfo(ctypes.Structure):
+    _fields_ = [("hAdapter", wintypes.UINT),
+                ("Type", ctypes.c_int),
+                ("pPrivateDriverData", ctypes.c_void_p),
+                ("PrivateDriverDataSize", wintypes.UINT)]
+
+
+class _D3DKMTAdapterRegistryInfo(ctypes.Structure):
+    _fields_ = [("AdapterString", wintypes.WCHAR * 260),
+                ("BiosString", wintypes.WCHAR * 260),
+                ("DacType", wintypes.WCHAR * 260),
+                ("ChipType", wintypes.WCHAR * 260)]
+
+
+class _D3DKMTAdapterPerfData(ctypes.Structure):
+    _fields_ = [("PhysicalAdapterIndex", wintypes.UINT),
+                ("MemoryFrequency", ctypes.c_uint64),
+                ("MaxMemoryFrequency", ctypes.c_uint64),
+                ("MaxMemoryFrequencyOC", ctypes.c_uint64),
+                ("MemoryBandwidth", ctypes.c_uint64),
+                ("PCIEBandwidth", ctypes.c_uint64),
+                ("FanRPM", wintypes.ULONG),
+                ("Power", wintypes.ULONG),
+                ("Temperature", wintypes.ULONG),
+                ("PowerStateOverride", ctypes.c_ubyte)]
+
+
+class _D3DKMTAdapterPerfCaps(ctypes.Structure):
+    _fields_ = [("PhysicalAdapterIndex", wintypes.UINT),
+                ("MaxMemoryBandwidth", ctypes.c_uint64),
+                ("MaxPCIEBandwidth", ctypes.c_uint64),
+                ("MaxFanRPM", wintypes.ULONG),
+                ("TemperatureMax", wintypes.ULONG),
+                ("TemperatureWarning", wintypes.ULONG)]
+
+
+class _D3DKMTCloseAdapter(ctypes.Structure):
+    _fields_ = [("hAdapter", wintypes.UINT)]
+
+
+class IntelD3DKMTTemperatureSampler:
+    """Read Intel GPU temperature through Windows WDDM/D3DKMT, avoiding IGCL/Level Zero."""
+
+    QUERY_REGISTRY_INFO = 8
+    QUERY_ADAPTER_PERF = 62
+    QUERY_ADAPTER_CAPS = 63
+
+    def __init__(self):
+        self.name = "Intel GPU"
+        self.handle = 0
+        self.max_temp = None
+        self.warning_temp = None
+        self._gdi32 = None
+        try:
+            gdi32 = ctypes.WinDLL("gdi32.dll")
+            gdi32.D3DKMTEnumAdapters2.argtypes = [ctypes.POINTER(_D3DKMTEnumAdapters2)]
+            gdi32.D3DKMTEnumAdapters2.restype = wintypes.LONG
+            gdi32.D3DKMTQueryAdapterInfo.argtypes = [ctypes.POINTER(_D3DKMTQueryAdapterInfo)]
+            gdi32.D3DKMTQueryAdapterInfo.restype = wintypes.LONG
+            gdi32.D3DKMTCloseAdapter.argtypes = [ctypes.POINTER(_D3DKMTCloseAdapter)]
+            gdi32.D3DKMTCloseAdapter.restype = wintypes.LONG
+            self._gdi32 = gdi32
+            self._connect()
+        except (OSError, AttributeError, ValueError):
+            self._gdi32 = None
+
+    def _query(self, handle, query_type, obj):
+        req = _D3DKMTQueryAdapterInfo(
+            int(handle), int(query_type), ctypes.addressof(obj), ctypes.sizeof(obj))
+        return int(self._gdi32.D3DKMTQueryAdapterInfo(ctypes.byref(req)))
+
+    def _close_handle(self, handle):
+        if not self._gdi32 or not handle:
+            return
+        try:
+            req = _D3DKMTCloseAdapter(int(handle))
+            self._gdi32.D3DKMTCloseAdapter(ctypes.byref(req))
+        except (OSError, ValueError):
+            pass
+
+    def _connect(self):
+        if not self._gdi32:
+            return False
+        if self.handle:
+            self._close_handle(self.handle)
+            self.handle = 0
+
+        first = _D3DKMTEnumAdapters2(0, None)
+        if self._gdi32.D3DKMTEnumAdapters2(ctypes.byref(first)) != 0 or first.NumAdapters == 0:
+            return False
+
+        adapters = (_D3DKMTAdapterInfo * int(first.NumAdapters))()
+        enum = _D3DKMTEnumAdapters2(first.NumAdapters, adapters)
+        if self._gdi32.D3DKMTEnumAdapters2(ctypes.byref(enum)) != 0:
+            return False
+
+        selected = 0
+        count = int(enum.NumAdapters)
+        for i in range(count):
+            adapter = adapters[i]
+            reg = _D3DKMTAdapterRegistryInfo()
+            if self._query(adapter.hAdapter, self.QUERY_REGISTRY_INFO, reg) == 0:
+                name = reg.AdapterString.strip()
+                if "intel" in name.lower():
+                    selected = int(adapter.hAdapter)
+                    self.name = name or "Intel GPU"
+                    caps = _D3DKMTAdapterPerfCaps()
+                    caps.PhysicalAdapterIndex = 0
+                    if self._query(selected, self.QUERY_ADAPTER_CAPS, caps) == 0:
+                        if caps.TemperatureMax > 0:
+                            self.max_temp = caps.TemperatureMax / 10.0
+                        if caps.TemperatureWarning > 0:
+                            self.warning_temp = caps.TemperatureWarning / 10.0
+                    break
+
+        for i in range(count):
+            handle = int(adapters[i].hAdapter)
+            if handle and handle != selected:
+                self._close_handle(handle)
+
+        self.handle = selected
+        return bool(self.handle)
+
+    def sample(self):
+        if not self.handle and not self._connect():
+            return None
+
+        perf = _D3DKMTAdapterPerfData()
+        perf.PhysicalAdapterIndex = 0
+        status = self._query(self.handle, self.QUERY_ADAPTER_PERF, perf)
+        if status != 0:
+            if not self._connect():
+                return None
+            perf = _D3DKMTAdapterPerfData()
+            perf.PhysicalAdapterIndex = 0
+            if self._query(self.handle, self.QUERY_ADAPTER_PERF, perf) != 0:
+                return None
+
+        temp = perf.Temperature / 10.0
+        return temp if 0.0 < temp < 200.0 else None
+
+    def close(self):
+        if self.handle:
+            self._close_handle(self.handle)
+            self.handle = 0
+
+
+def gpu_stats(lhm_sensors_snapshot=None, intel_sampler=None):
+    """Return discrete GPUs, keeping NVIDIA first and using WDDM for Intel temperature."""
+    result = nvidia_stats() + intel_gpu_stats_from_lhm(lhm_sensors_snapshot)
+    if intel_sampler:
+        temp = intel_sampler.sample()
+        intel_gpu = next((g for g in result if g.get("vendor") == "intel"), None)
+        if intel_gpu is not None and temp is not None:
+            intel_gpu["temp"] = temp
+            intel_gpu["temp_max"] = intel_sampler.max_temp
+            intel_gpu["temp_warning"] = intel_sampler.warning_temp
+            intel_gpu["source"] = "lhm+d3dkmt"
+        elif intel_gpu is None and temp is not None:
+            result.append({
+                "name": intel_sampler.name, "vendor": "intel", "source": "d3dkmt",
+                "temp": temp, "temp_max": intel_sampler.max_temp,
+                "temp_warning": intel_sampler.warning_temp,
+                "load": None, "mem_used": None, "mem_total": None,
+                "clock": None, "memory_clock": None, "power": None, "power_limit": None,
+                "fan": None, "fan_rpm": None, "voltage": None,
+            })
     return result
 
 
@@ -5658,9 +6435,60 @@ def active_connections(name_cache=None):
 _SENSOR_TYPES = "'Temperature','Fan','Power','Clock','Voltage','Control'"
 
 BRIDGE_DIR = Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData")) / "ThermalWatch"
-BRIDGE_SENSORS_PATH = BRIDGE_DIR / "sensors.json"
-BRIDGE_STATUS_PATH = BRIDGE_DIR / "bridge_status.json"
-BRIDGE_NETPROC_PATH = BRIDGE_DIR / "network_processes.json"
+BRIDGE_SENSORS_PATH = BRIDGE_DIR / "sensors_v3.json"
+BRIDGE_STATUS_PATH = BRIDGE_DIR / "bridge_status_v3.json"
+BRIDGE_NETPROC_PATH = BRIDGE_DIR / "network_processes_v3.json"
+
+# --- Nox AI thermal-shutdown integration -------------------------------------------------
+# Deliberately independent of CPU_RED/TJMAX above (Thermal Watch's own UI ceiling) - tied
+# instead to AMD's published TjMax for the 9950X (95C), the point the CPU itself is forced to
+# start throttling. Uses its own sustained-duration check, separate from the UI's
+# CPU_ALERT_DEBOUNCE_S, so a brief single-core boost spike (normal Zen 5 behavior) can't fire
+# it - only a genuinely sustained near-TjMax reading does.
+NOX_ALERT_TEMP_C = 95.0
+NOX_ALERT_RECOVER_C = 90.0  # hysteresis: must drop back below this (not just under the trigger) to re-arm
+NOX_ALERT_SUSTAINED_S = 10.0
+NOX_ALERT_URL = "http://127.0.0.1:8799/thermal-alert"
+NOX_ALERT_KEY_PATH = BRIDGE_DIR / "nox_alert_key.txt"
+
+
+def _nox_alert_key():
+    """Shared secret with Nox AI's /thermal-alert endpoint: a plain file in the same
+    ProgramData dir the sensor bridge already writes to, generated by whichever side runs
+    first. Not a new trust boundary - both processes already run as the same logged-in user
+    on the same machine as this file's directory."""
+    try:
+        return NOX_ALERT_KEY_PATH.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def _send_nox_thermal_alert(value, top_cpu_processes, foreground_process):
+    """Fire-and-forget POST to Nox AI when sustained near-TjMax CPU temp is confirmed. Always
+    called on its own thread (never the Tk main loop) and never raises - a failed/unreachable
+    Nox AI must never affect Thermal Watch's own monitoring."""
+    key = _nox_alert_key()
+    if not key:
+        return
+    payload = {
+        "source": "thermal_watch",
+        "component": "cpu",
+        "value_c": value,
+        "threshold_c": NOX_ALERT_TEMP_C,
+        # [[name, pid, pct], ...] - Nox re-resolves PIDs fresh at kill time rather than trusting
+        # a PID that may already be stale by the time this alert is received and acted on.
+        "top_cpu_processes": top_cpu_processes,
+        "foreground_process": foreground_process,
+        "timestamp": time.time(),
+    }
+    request = urllib.request.Request(
+        NOX_ALERT_URL, data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "X-Thermal-Watch-Key": key}, method="POST",
+    )
+    try:
+        urllib.request.urlopen(request, timeout=3.0).read(1024)
+    except (OSError, urllib.error.URLError):
+        pass  # Nox AI not running/unreachable - the CPU is on its own to survive on hardware throttling
 BRIDGE_FRESH_SECONDS = 10  # unchanged value - was already the freshness cutoff below, now named
 BRIDGE_RECOVERY_MIN_INTERVAL_S = 45  # rate limit: don't re-trigger elevation/UAC more often than this
 
@@ -5683,14 +6511,27 @@ def network_processes():
 
 def lhm_sensors():
     # The elevated bridge keeps privileged driver access out of the UI process.
+    # If that bridge is still alive but its snapshot is stale, do NOT pile a synchronous
+    # WMI/direct-LHM fallback on top of the same wedged hardware call. Those fallbacks can
+    # block the worker for 3+8 seconds per refresh and make the dashboard look frozen.
+    # Vendor-native GPU paths (nvidia-smi / Windows D3DKMT) continue independently.
+    cached_payload = None
     try:
-        payload = json.loads(BRIDGE_SENSORS_PATH.read_text(encoding="utf-8-sig"))
-        if time.time() - float(payload["timestamp"]) < BRIDGE_FRESH_SECONDS:
-            return payload.get("sensors", [])
+        cached_payload = json.loads(BRIDGE_SENSORS_PATH.read_text(encoding="utf-8-sig"))
+        if time.time() - float(cached_payload["timestamp"]) < BRIDGE_FRESH_SECONDS:
+            return cached_payload.get("sensors", [])
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        cached_payload = None
+
+    try:
+        status = bridge_status()
+        pid = status.get("pid") if status else None
+        if pid and _process_exists(pid):
+            return []
+    except (OSError, ValueError, TypeError, AttributeError):
         pass
 
-    # Prefer the WMI feed when LibreHardwareMonitor exposes it.
+    # Prefer the WMI feed when no bridge process is alive and LibreHardwareMonitor exposes it.
     ps = (
         "Get-CimInstance -Namespace root/LibreHardwareMonitor -ClassName Sensor -ErrorAction SilentlyContinue|"
         f"Where-Object {{$_.SensorType -in @({_SENSOR_TYPES})}}|Select Name,SensorType,Value,Parent|ConvertTo-Json -Compress"
@@ -5780,7 +6621,7 @@ def compute_bridge_health(tier1_age, status):
 def spawn_bridge_recovery():
     """Best-effort, non-blocking elevation attempt. If the user declines UAC or it otherwise
     fails, this simply doesn't start a new bridge - callers must keep working via Tier 2/3."""
-    bridge_ps1 = str(_APP_DIR / "sensor_bridge.ps1")
+    bridge_ps1 = str(_APP_DIR / "sensor_bridge_v3.ps1")
     inner = (
         "Start-Process -FilePath 'powershell.exe' -ArgumentList "
         f"'-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"{bridge_ps1}\"' "
@@ -5857,10 +6698,16 @@ class MetricCard(tk.Frame):
         tk.Label(foot, text="0", bg=PANEL, fg=DIM, font=(MONO, 7)).pack(side="left")
         self.foot_mid = tk.Label(foot, text="", bg=PANEL, fg=DIM, font=(MONO, 7))
         self.foot_mid.pack(side="left", expand=True)
-        tk.Label(foot, text=str(int(scale_max)), bg=PANEL, fg=DIM, font=(MONO, 7)).pack(side="right")
+        self.scale_end = tk.Label(foot, text=str(int(scale_max)), bg=PANEL, fg=DIM, font=(MONO, 7))
+        self.scale_end.pack(side="right")
 
     def set_footer(self, text):
         self.foot_mid.config(text=text)
+
+    def set_scale_max(self, scale_max):
+        """Update the visual scale endpoint without claiming it is a hardware thermal limit."""
+        self.scale_max = scale_max
+        self.scale_end.config(text="--" if scale_max is None else str(int(round(scale_max))))
 
     def update_value(self, value, sub_status, peak, avg, ratio=None):
         if value is None:
@@ -6018,15 +6865,26 @@ def style_option_menu(om, padx=8, pady=3):
     return om
 
 
-def style_scrollbar(sb):
-    """Dark-themes a classic tk.Scrollbar - left alone it renders as the native light-gray
-    Windows scrollbar (trough, thumb AND arrow buttons all in the system theme), the same kind
-    of clash tk.OptionMenu has. One shared helper for the same reason style_option_menu is: every
-    scrollbar in the app should look identical rather than accumulating N slightly different
-    hand-rolled configure() calls."""
-    sb.configure(bg=BORDER2, activebackground=MUTED, troughcolor=PANEL, highlightthickness=0,
-                relief="flat", bd=0, elementborderwidth=0)
-    return sb
+def dark_scrollbar(parent, command):
+    """Dark vertical scrollbar. Replaces the old style_scrollbar(tk.Scrollbar(...)) helper:
+    on Windows the classic tk.Scrollbar is drawn by the NATIVE theme engine, which silently
+    ignores bg/troughcolor/activebackground - so that helper looked correct in code but every
+    scrollbar still rendered as the light-gray system one. A ttk.Scrollbar under the clam
+    theme actually honors these colors. Forces clam if it isn't active yet (process-global,
+    same note as the Treeview windows), then (re)configures the shared style - configure() is
+    idempotent, so calling it once per scrollbar keeps every call site identical instead of
+    hoping some earlier window already defined the style."""
+    style = ttk.Style(parent)
+    if style.theme_use() != "clam":
+        style.theme_use("clam")
+    style.configure("Thermal.Vertical.TScrollbar", background=BORDER2, troughcolor=PANEL,
+                    bordercolor=PANEL, lightcolor=BORDER2, darkcolor=BORDER2,
+                    arrowcolor=MUTED, relief="flat", width=10, arrowsize=10)
+    style.map("Thermal.Vertical.TScrollbar",
+              background=[("active", MUTED), ("!active", BORDER2)],
+              arrowcolor=[("active", TEXT), ("!active", MUTED)])
+    return ttk.Scrollbar(parent, orient="vertical", command=command,
+                         style="Thermal.Vertical.TScrollbar")
 
 
 def _colorref(hex_color):
@@ -6147,7 +7005,7 @@ class ScrollFrame(tk.Frame):
     def __init__(self, parent, bg=PANEL, height=1, **kw):
         super().__init__(parent, bg=bg, **kw)
         self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0, height=height)
-        vsb = style_scrollbar(tk.Scrollbar(self, orient="vertical", command=self.canvas.yview, width=10))
+        vsb = dark_scrollbar(self, self.canvas.yview)
         self.inner = tk.Frame(self.canvas, bg=bg)
         self._window = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
         self.canvas.configure(yscrollcommand=vsb.set)
@@ -6606,7 +7464,7 @@ class HistoryWindow(tk.Toplevel):
             self.tree.column(c, width=widths[c], anchor=anchors.get(c, "w"))
         for zone in ("YELLOW", "ORANGE", "RED"):
             self.tree.tag_configure(f"sev_{zone}", foreground=self.SEVERITY_COLOR[zone])
-        vsb = style_scrollbar(tk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview, width=10))
+        vsb = dark_scrollbar(table_frame, self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
@@ -8970,10 +9828,11 @@ class AISettingsWindow(tk.Toplevel):
 # small curated table, not a generic "pick any two metrics" engine, so a comparison never mixes
 # incompatible units (a temperature against a percentage) onto one shared axis.
 TELEMETRY_COMPARE_OPTIONS = {
-    "cpu_temp": ["gpu_core_temp", "gpu_hotspot_temp", "gpu_vram_temp"],
-    "gpu_core_temp": ["gpu_hotspot_temp", "gpu_vram_temp", "cpu_temp"],
-    "gpu_hotspot_temp": ["gpu_core_temp", "gpu_vram_temp", "cpu_temp"],
-    "gpu_vram_temp": ["gpu_core_temp", "gpu_hotspot_temp", "cpu_temp"],
+    "cpu_temp": ["gpu_core_temp", "arc_core_temp", "gpu_hotspot_temp", "gpu_vram_temp"],
+    "gpu_core_temp": ["arc_core_temp", "gpu_hotspot_temp", "gpu_vram_temp", "cpu_temp"],
+    "arc_core_temp": ["gpu_core_temp", "cpu_temp", "gpu_hotspot_temp", "gpu_vram_temp"],
+    "gpu_hotspot_temp": ["gpu_core_temp", "arc_core_temp", "gpu_vram_temp", "cpu_temp"],
+    "gpu_vram_temp": ["gpu_core_temp", "arc_core_temp", "gpu_hotspot_temp", "cpu_temp"],
     "cpu_power": ["gpu_power"], "gpu_power": ["cpu_power"],
     "cpu_util": ["gpu_util"], "gpu_util": ["cpu_util"],
 }
@@ -9357,29 +10216,76 @@ class App(tk.Tk):
         # main dashboard's. Purely cosmetic: never let a missing/unreadable .ico file stop the
         # app from starting.
         try:
-            self.iconbitmap(default=str(_APP_DIR / "thermal_watch.ico"))
-        except tk.TclError:
+            icon_path = str(_APP_DIR / "thermal_watch.ico")
+            self.iconbitmap(default=icon_path)
+
+            def _apply_native_window_icon():
+                if os.name != "nt":
+                    return
+                try:
+                    IMAGE_ICON, LR_LOADFROMFILE, LR_DEFAULTSIZE = 1, 0x0010, 0x0040
+                    WM_SETICON, ICON_SMALL, ICON_BIG = 0x0080, 0, 1
+                    user32 = ctypes.windll.user32
+                    user32.LoadImageW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint,
+                                                  ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+                    user32.LoadImageW.restype = ctypes.c_void_p
+                    user32.SendMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                                    ctypes.c_void_p, ctypes.c_void_p]
+                    user32.SendMessageW.restype = ctypes.c_ssize_t
+                    user32.GetParent.argtypes = [ctypes.c_void_p]
+                    user32.GetParent.restype = ctypes.c_void_p
+                    hicon = user32.LoadImageW(None, icon_path, IMAGE_ICON, 0, 0,
+                                              LR_LOADFROMFILE | LR_DEFAULTSIZE)
+                    if not hicon:
+                        return
+                    hwnd = ctypes.c_void_p(self.winfo_id())
+                    wrapper = user32.GetParent(hwnd)
+                    for target in (hwnd, wrapper):
+                        if target:
+                            user32.SendMessageW(target, WM_SETICON, ctypes.c_void_p(ICON_BIG), hicon)
+                            user32.SendMessageW(target, WM_SETICON, ctypes.c_void_p(ICON_SMALL), hicon)
+                    self._native_window_hicon = hicon
+                except (tk.TclError, OSError, AttributeError, ValueError):
+                    pass
+
+            # Tk creates a wrapper HWND after __init__ starts. Apply the icon once that wrapper
+            # exists so the taskbar receives it, not only the inner Tk client window.
+            self.after(150, _apply_native_window_icon)
+        except (tk.TclError, OSError, AttributeError):
             pass
 
         self.info = hardware_info()
         self.samples = []
         self.chart_points = []
         self.events = deque(maxlen=200)
-        self.q = queue.Queue()
+        # Live UI snapshots are ephemeral: if the UI falls behind, only the newest reading matters.
+        # Keep this bounded so a dead Tk callback can never accumulate hours of stale snapshots.
+        self.q = queue.Queue(maxsize=2)
         self.stop_event = threading.Event()
+        self._evidence_cache = None
+        self._evidence_cache_lock = threading.Lock()
+        self.evidence_pipe_server = None
         self.last_cpu = cpu_times()
         self.start_time = time.time()
         self.silence_until = 0.0
 
-        self.cpu_peak = self.gpu_peak = 0.0
-        self.cpu_sum = self.gpu_sum = 0.0
-        self.cpu_n = self.gpu_n = 0
+        self.cpu_peak = self.gpu_peak = self.arc_peak = 0.0
+        self.cpu_sum = self.gpu_sum = self.arc_sum = 0.0
+        self.cpu_n = self.gpu_n = self.arc_n = 0
+
+        # USAGE tab peak/avg accumulators - same pattern as cpu_peak/gpu_peak above, no shared
+        # helper exists in this file, so each metric gets its own explicit triplet.
+        self.cpu_load_peak = self.mem_load_peak = self.disk_activity_peak = self.gpu_load_peak = 0.0
+        self.cpu_load_sum = self.mem_load_sum = self.disk_activity_sum = self.gpu_load_sum = 0.0
+        self.cpu_load_n = self.mem_load_n = self.disk_activity_n = self.gpu_load_n = 0
 
         self.active_alerts = {}  # key -> {"since": ts, "text": str, "zone": optional str}
         self.curve_escalated = False
 
         self.cpu_zone_confirmed = "GREEN"
         self.cpu_zone_pending = {"zone": "GREEN", "since": time.time()}
+        self.nox_alert_pending_since = None  # first tick CPU crossed NOX_ALERT_TEMP_C, or None
+        self.nox_alert_armed = True  # False once an alert has fired, until temp recovers below NOX_ALERT_RECOVER_C
         self.drive_zone_state = {}  # drive_key -> {"confirmed": str, "pending": {"zone": str, "since": ts}}
         self.sensor_zone_state = {}  # generic per-sensor state for GPU sub-sensors / RAM, same shape
         self.cpu_fan_alert_state = {"confirmed": False, "pending_since": None}
@@ -9392,6 +10298,9 @@ class App(tk.Tk):
         # _sync_rows(). Keeps a poll from tearing down/rebuilding widgets that haven't changed.
         self.fan_rows, self.volt_rows, self.disk_rows = {}, {}, {}
         self.gpu_thermal_rows, self.mobo_rows, self.ram_rows = {}, {}, {}
+        self.gpu_device_rows = {}
+        self.apps_rows = {}
+        self.disk_activity_rows = {}
         self.alert_strip_visible = False
         self.widget_stats = {"rows_created": 0, "rows_destroyed": 0}
 
@@ -9403,6 +10312,15 @@ class App(tk.Tk):
         self.last_foreground = None
         self.last_cpu_top = []
         self.last_gpu_top = []
+        self.last_apps_top = []
+        self.last_cpu_cores = []
+        self.last_mem_composition = {}
+        self.last_disk_activity = []
+        self.last_gpu_engines = {}
+        self.last_cpu_load_pct = 0.0
+        self.last_mem_load_pct = 0.0
+        self.last_gpu_load_pct = None
+        self.last_mem_total_bytes = 0.0
 
         # Incident history (see INCIDENTS_PATH above). incidents_active is keyed EXACTLY like
         # active_alerts ("cpu", "disk:<parent>", "sensor:gpu_hotspot", "sensor:dimm:DIMM #1")
@@ -9470,6 +10388,13 @@ class App(tk.Tk):
         self.build()
         self.worker_thread = threading.Thread(target=self.worker, daemon=True)
         self.worker_thread.start()
+        if EVIDENCE_PIPE_ENABLED:
+            self.evidence_pipe_server = EvidencePipeServer(
+                request_handler=self._handle_evidence_pipe_request,
+                stop_event=self.stop_event,
+                log=self._log_pipe_event,
+            )
+            self.evidence_pipe_server.start()
         self.after(100, self.poll)
         self.after(1000, self.tick_uptime)
         self.after(5000, self.check_bridge_health)
@@ -9478,7 +10403,8 @@ class App(tk.Tk):
         self.after(SESSION_RECONCILE_DELAY_MS, self._reconcile_restored_sessions)
         self.after(SESSION_ACTIVE_FLUSH_INTERVAL_MS, self._flush_active_sessions_periodic)
         self.after(REPORT_STARTUP_DELAY_MS, self._check_due_reports)
-        self.after(EVIDENCE_SNAPSHOT_INTERVAL_MS, self._flush_evidence_periodic)
+        self.after(EVIDENCE_SNAPSHOT_FIRST_FLUSH_MS, self._flush_evidence_periodic)
+        self.after(TOTALS_FIRST_REFRESH_MS, self._refresh_totals_periodic)
 
         # Phase 16 - AI Integration Settings. One-time, best-effort load: config only needs to
         # (re)load at startup and whenever AISettingsWindow saves/resets it (via
@@ -9581,32 +10507,78 @@ class App(tk.Tk):
                   highlightthickness=0, cursor="hand2").pack(side="left", padx=4)
         # strip stays unpacked until an active, unsilenced alert exists
 
+        # Tabbed body: DASHBOARD (everything that used to be the whole scrollable body, below
+        # the fixed header/alert area) and APPS (new resource monitor). ttk theme is process-
+        # global (one Tcl interpreter - see the identical note on HistoryWindow's table below)
+        # and this is the first ttk widget on the always-visible main window, so unlike a
+        # Toplevel that can set it lazily on first open, it must be forced here at startup -
+        # otherwise the tab strip renders in the native light theme until/unless the user
+        # happens to open History first.
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        # clam's default TNotebook/Tab elements draw a light bordercolor bevel (lightcolor/
+        # darkcolor) and a dotted focus ring on the selected tab - configure() alone doesn't
+        # reach those, so without pinning them explicitly to the dark palette they render as a
+        # visible light-gray frame regardless of background/foreground being set correctly.
+        # lightcolor/darkcolor here are the pane's bevel around the CONTENT area (not the tabs)
+        # - clam defaults them to light grays, which drew the visible frame around the whole
+        # dashboard body; bordercolor/borderwidth alone don't reach that bevel.
+        style.configure("Thermal.TNotebook", background=BG, borderwidth=0, bordercolor=BG,
+                        lightcolor=BG, darkcolor=BG, tabmargins=(0, 0, 0, 0))
+        # Base state (unselected tabs) pins bordercolor/lightcolor/darkcolor to PANEL - the
+        # same as the tab's own background - so an unselected tab has NO visible edge at all.
+        # Only the map() below brightens those to BORDER for the selected tab specifically;
+        # the earlier bug was setting bordercolor=BORDER here unconditionally, which drew a
+        # lighter-than-background outline around every tab, selected or not.
+        style.configure("Thermal.TNotebook.Tab", background=PANEL, foreground=MUTED,
+                        padding=(16, 8), font=(MONO, 9), borderwidth=0, bordercolor=PANEL,
+                        lightcolor=PANEL, darkcolor=PANEL, focuscolor=BG)
+        style.map("Thermal.TNotebook.Tab",
+                  background=[("selected", BORDER), ("!selected", PANEL)],
+                  foreground=[("selected", TEXT), ("!selected", MUTED)],
+                  bordercolor=[("selected", BORDER), ("!selected", PANEL)],
+                  lightcolor=[("selected", BORDER), ("!selected", PANEL)],
+                  darkcolor=[("selected", BORDER), ("!selected", PANEL)],
+                  focuscolor=[("selected", BG), ("!selected", BG)])
+
+        self.notebook = ttk.Notebook(root_pad, style="Thermal.TNotebook")
+        self.notebook.pack(fill="both", expand=True, pady=(12, 0))
+
+        tab_dashboard = tk.Frame(self.notebook, bg=BG)
+        self.notebook.add(tab_dashboard, text="  DASHBOARD  ")
+
         # scrollable body: everything below the fixed header/alert area
-        page = ScrollFrame(root_pad, bg=BG, height=1)
-        page.pack(fill="both", expand=True, pady=(12, 0))
+        page = ScrollFrame(tab_dashboard, bg=BG, height=1)
+        page.pack(fill="both", expand=True)
         outer = page.inner
 
         # primary readouts
         cards = tk.Frame(outer, bg=BG); cards.pack(fill="x", pady=(0, 0))
         self.cards = cards
-        for i in range(3):
+        for i in range(4):
             cards.grid_columnconfigure(i, weight=1, uniform="cards")
         self.cpu_card = MetricCard(cards, "CPU PACKAGE", "\u00b0C", GREEN, CPU_ORANGE, TJMAX, zone_fn=cpu_zone_for,
                                     ticks=[(CPU_YELLOW, AMBER), (CPU_ORANGE, ORANGE), (CPU_RED, RED)])
-        self.gpu_card = MetricCard(cards, "GPU CORE", "\u00b0C", GREEN, 83.0, GPU_TMAX,
+        self.gpu_card = MetricCard(cards, "RTX 3090 CORE", "\u00b0C", GREEN, 83.0, GPU_TMAX,
                                     zone_fn=lambda v: zone_for(v, GPU_CORE_ZONES),
                                     ticks=[(75.0, AMBER), (83.0, ORANGE), (90.0, RED)])
+        self.arc_card = MetricCard(cards, "INTEL ARC", "\u00b0C", BLUE, float("inf"), 100.0,
+                                    ticks=[])
+        self.arc_card.set_scale_max(None)
         self.mem_card = MetricCard(cards, "SYSTEM MEMORY", "%", BLUE, THRESH_MEM, 100)
         self.cpu_card.set_footer(f"TJMAX {TJMAX:.0f} \u00b7 80 WARN \u00b7 90 CRIT \u00b7 100 EMERGENCY")
         self.gpu_card.set_footer(f"MAX {GPU_TMAX:.0f} \u00b7 75 WARM \u00b7 83 HOT \u00b7 90 CRITICAL")
+        self.arc_card.set_footer("WINDOWS WDDM SENSOR \u00b7 DRIVER LIMIT WHEN AVAILABLE")
         self.mem_card.set_footer(f"ALERT AT {THRESH_MEM:.0f}%")
-        for i, c in enumerate((self.cpu_card, self.gpu_card, self.mem_card)):
-            c.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 6, 0 if i == 2 else 6))
+        top_cards = (self.cpu_card, self.gpu_card, self.arc_card, self.mem_card)
+        for i, c in enumerate(top_cards):
+            c.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 6, 0 if i == len(top_cards) - 1 else 6))
         # Sensor drill-down (item 7) - CPU Package/GPU Core are clickable straight to their
         # history; System Memory is left alone (not a per-tick telemetry scalar sensor in the
         # same sense - it's a live utilization card, not something item 2 asks to drill into).
         self._bind_click(self.cpu_card, lambda: self.open_sensor_history(scalar_sensor_ref("cpu_temp")))
         self._bind_click(self.gpu_card, lambda: self.open_sensor_history(scalar_sensor_ref("gpu_core_temp")))
+        self._bind_click(self.arc_card, lambda: self.open_sensor_history(scalar_sensor_ref("arc_core_temp")))
 
         # chart + event log - bounded height (not expand=True) so this row can't greedily
         # consume all remaining space and push the panels below it out of view; the event
@@ -9766,6 +10738,53 @@ class App(tk.Tk):
         self.net_empty = self._make_empty_label(self.net_panel, "No active network adapter detected.")
         self.net_empty_shown = False
 
+        # totals strip - "over the retention window" totals (energy/data/monitored time/incident
+        # and session counts), reconstructed on demand from existing history rather than a live
+        # accumulator (there is no lifetime/since-install counter anywhere in this app - see
+        # compute_totals_summary()'s own docstring). A purely additive row above the existing
+        # stat strip; nothing below it is resized, moved, or restyled.
+        totals = tk.Frame(outer, bg=BG); totals.pack(fill="x", pady=(12, 0))
+        _TOTALS_CELLS = (("energy", "ENERGY"), ("cost", "EST. COST"), ("down", "DOWNLOADED"),
+                         ("up", "UPLOADED"), ("monitored", "MONITORED"),
+                         ("incidents", "INCIDENTS"), ("sessions", "SESSIONS"),
+                         # Kept last, visually separate from the 7 cells above it (all real
+                         # Thermal Watch measurements) - this one is a hand-set assumption about
+                         # an external monitor with no sensor of its own. See
+                         # MONITOR_ESTIMATED_WATTS' own comment.
+                         ("monitor_cost", "MONITOR (EST.)"),
+                         # The one bottom-line number - PC's real cost + the monitor guess above
+                         # it, added together. None whenever EST. COST is (see
+                         # combined_cost_mxn's own comment in compute_totals_summary()).
+                         ("combined_cost", "TOTAL (EST.)"))
+        for i in range(len(_TOTALS_CELLS)):
+            totals.grid_columnconfigure(i, weight=1, uniform="totals")
+        self.totals_labels = {}
+        last_i = len(_TOTALS_CELLS) - 1
+        for i, (key, label) in enumerate(_TOTALS_CELLS):
+            cell = tk.Frame(totals, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
+            cell.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 3, 0 if i == last_i else 3))
+            tk.Label(cell, text=label, bg=PANEL, fg=DIM, font=(MONO, 8)).pack(anchor="w", padx=12, pady=(8, 2))
+            lbl = tk.Label(cell, text="--", bg=PANEL, fg=TEXT, font=(MONO, 13)); lbl.pack(anchor="w", padx=12, pady=(0, 8))
+            self.totals_labels[key] = lbl
+        # Cost and external-monitor figures are optional user assumptions, never measured
+        # telemetry. Public builds intentionally ship without defaults; an unset value renders
+        # as N/A instead of silently borrowing somebody else's tariff or monitor wattage.
+        rate_note = (
+            f"{ELECTRICITY_RATE_MXN_PER_KWH:.3f} MXN/kWh"
+            if ELECTRICITY_RATE_MXN_PER_KWH is not None else "not configured"
+        )
+        monitor_note = (
+            f"{MONITOR_ESTIMATED_WATTS:.0f} W"
+            if MONITOR_ESTIMATED_WATTS is not None else "not configured"
+        )
+        tk.Label(totals, text=f"Last {TOTALS_WINDOW_DAYS} days - Thermal Watch keeps this much "
+                              f"history. Cost rate: {rate_note}. External monitor estimate: "
+                              f"{monitor_note}. Set THERMAL_WATCH_ELECTRICITY_RATE_MXN_PER_KWH "
+                              "and THERMAL_WATCH_MONITOR_ESTIMATED_WATTS to opt in; these are "
+                              "assumptions, not sensor measurements.",
+                 bg=BG, fg=DIM, font=(MONO, 8)).grid(row=1, column=0, columnspan=len(_TOTALS_CELLS),
+                                                     sticky="w", pady=(4, 0))
+
         # stat strip
         strip = tk.Frame(outer, bg=BG); strip.pack(fill="x", pady=(12, 0))
         for i in range(6):
@@ -9799,6 +10818,265 @@ class App(tk.Tk):
         self.load_sessions()
         self.load_active_sessions()
         self.init_telemetry_store()
+
+        tab_apps = tk.Frame(self.notebook, bg=BG)
+        self.notebook.add(tab_apps, text="  APPS  ")
+        self._build_apps_tab(tab_apps)
+
+        tab_usage = tk.Frame(self.notebook, bg=BG)
+        self.notebook.add(tab_usage, text="  USAGE  ")
+        self._build_usage_tab(tab_usage)
+
+    def _build_apps_tab(self, parent):
+        container = tk.Frame(parent, bg=BG); container.pack(fill="both", expand=True, padx=20, pady=16)
+        self.apps_panel = Panel(container, "RUNNING APPLICATIONS", scrollable=True)
+        self.apps_panel.pack(fill="both", expand=True)
+
+        header = tk.Frame(self.apps_panel.body, bg=PANEL); header.pack(fill="x", pady=(0, 4))
+        for text, width, anchor in (("NAME", 24, "w"), ("PID", 8, "e"), ("CPU%", 8, "e"),
+                                    ("MEMORY", 10, "e"), ("DISK I/O", 22, "e"), ("GPU%", 8, "e")):
+            tk.Label(header, text=text, bg=PANEL, fg=DIM, font=(MONO, 8), width=width,
+                    anchor=anchor).pack(side="left")
+        # A plain sub-frame, not self.apps_panel.body directly, so this static header row is
+        # never swept up by _sync_rows' stale-key cleanup pass as though it were a process row.
+        self.apps_row_body = tk.Frame(self.apps_panel.body, bg=PANEL)
+        self.apps_row_body.pack(fill="both", expand=True)
+        tk.Label(self.apps_panel.foot, text=f"Top {APPS_TAB_TOP_N} by CPU usage — refreshes every "
+                f"{POLL_SECONDS}s, same interval as the thermal dashboard",
+                bg=PANEL, fg=DIM, font=(MONO, 9)).pack(side="left")
+
+    def _update_apps_tab(self):
+        def build_apps_row(parent):
+            row = tk.Frame(parent, bg=PANEL); row.pack(fill="x", pady=2)
+            name_lbl = tk.Label(row, bg=PANEL, fg=TEXT, font=(MONO, 9), width=24, anchor="w")
+            name_lbl.pack(side="left")
+            pid_lbl = tk.Label(row, bg=PANEL, fg=MUTED, font=(MONO, 9), width=8, anchor="e")
+            pid_lbl.pack(side="left")
+            cpu_lbl = tk.Label(row, bg=PANEL, fg="#c7ccd4", font=(MONO, 9), width=8, anchor="e")
+            cpu_lbl.pack(side="left")
+            mem_lbl = tk.Label(row, bg=PANEL, fg=MUTED, font=(MONO, 9), width=10, anchor="e")
+            mem_lbl.pack(side="left")
+            disk_lbl = tk.Label(row, bg=PANEL, fg=MUTED, font=(MONO, 9), width=22, anchor="e")
+            disk_lbl.pack(side="left")
+            gpu_lbl = tk.Label(row, bg=PANEL, fg=MUTED, font=(MONO, 9), width=8, anchor="e")
+            gpu_lbl.pack(side="left")
+            return {"frame": row, "name": name_lbl, "pid": pid_lbl, "cpu": cpu_lbl,
+                   "mem": mem_lbl, "disk": disk_lbl, "gpu": gpu_lbl}
+
+        apps_specs = []
+        for r in self.last_apps_top:
+            def update_apps_row(refs, r=r):
+                refs["name"].config(text=r["name"])
+                refs["pid"].config(text=str(r["pid"]))
+                refs["cpu"].config(text=f"{r['cpu_pct']:.1f}%")
+                refs["mem"].config(text=fmt_net_bytes(r["memory_bytes"]))
+                down = f"{fmt_net_bytes(r['disk_read_bps'])}/s" if r["disk_read_bps"] is not None else "--"
+                up = f"{fmt_net_bytes(r['disk_write_bps'])}/s" if r["disk_write_bps"] is not None else "--"
+                refs["disk"].config(text=f"↓{down} ↑{up}")
+                refs["gpu"].config(text=f"{r['gpu_pct']:.1f}%" if r["gpu_pct"] is not None else "--")
+            apps_specs.append((r["pid"], build_apps_row, update_apps_row))
+        self._sync_rows(self.apps_rows, self.apps_row_body, apps_specs)
+
+    def _update_gpu_devices(self, gpus):
+        def build_gpu_device_row(parent):
+            row = tk.Frame(parent, bg=PANEL); row.pack(fill="x", pady=3)
+            name = tk.Label(row, bg=PANEL, fg=TEXT, font=(MONO, 9, "bold"), width=34, anchor="w")
+            name.pack(side="left")
+            detail = tk.Label(row, bg=PANEL, fg=MUTED, font=(MONO, 9), anchor="w")
+            detail.pack(side="left", fill="x", expand=True, padx=(8, 0))
+            badge = tk.Label(row, bg=PANEL, fg=DIM, font=(MONO, 8, "bold"), width=10, anchor="e")
+            badge.pack(side="right")
+            return {"frame": row, "name": name, "detail": detail, "badge": badge}
+
+        specs = []
+        for index, gpu in enumerate(gpus or []):
+            name = gpu.get("name") or f"GPU {index}"
+            key = (gpu.get("vendor") or ("nvidia" if "nvidia" in name.lower() else "gpu"), name)
+            display = name.replace("Intel(R)", "Intel").replace("(TM)", "").replace("  ", " ").strip()
+
+            def update_gpu_device_row(refs, gpu=gpu, display=display, index=index):
+                parts = []
+                if gpu.get("temp") is not None: parts.append(f"TEMP {gpu['temp']:.0f}°C")
+                if gpu.get("clock") is not None: parts.append(f"CORE {gpu['clock']:.0f} MHz")
+                if gpu.get("power") is not None: parts.append(f"POWER {gpu['power']:.0f} W")
+                if gpu.get("fan_rpm") is not None: parts.append(f"FAN {gpu['fan_rpm']:.0f} RPM")
+                elif gpu.get("fan") is not None: parts.append(f"FAN {gpu['fan']:.0f}%")
+                if gpu.get("mem_total") is not None:
+                    used = gpu.get("mem_used")
+                    parts.append(f"VRAM {used / 1024:.1f}/{gpu['mem_total'] / 1024:.1f} GB" if used is not None
+                                 else f"VRAM {gpu['mem_total'] / 1024:.1f} GB")
+                refs["name"].config(text=display)
+                refs["detail"].config(text="  ·  ".join(parts) if parts else "Detected · telemetry unavailable")
+                refs["badge"].config(text="PRIMARY" if index == 0 else "SECONDARY",
+                                     fg=GREEN if index == 0 else BLUE)
+
+            specs.append((key, build_gpu_device_row, update_gpu_device_row))
+
+        self._sync_rows(self.gpu_device_rows, self.gpu_devices_panel.body, specs)
+        self.gpu_devices_empty_shown = self._toggle_visible(
+            self.gpu_devices_empty, self.gpu_devices_empty_shown, not bool(gpus), anchor="w", pady=4)
+
+    # -- USAGE tab -----------------------------------------------------------------------
+    # 2x2 grid of MetricCard (the same widget the DASHBOARD tab's CPU PACKAGE/GPU CORE/SYSTEM
+    # MEMORY cards use) plus a metric-specific breakdown under each. Headline numbers reuse
+    # already-computed scalars (self.last_cpu_load_pct etc, stashed in update_data next to the
+    # existing cpu_card/gpu_card/mem_card update) - only the breakdown widgets read the new
+    # per-core/per-drive/per-engine sampler output.
+    GPU_ENGINE_DISPLAY = [("3D", "3D"), ("Copy", "Copy"), ("VideoDecode", "Video decode"), ("VideoEncode", "Video encode")]
+
+    def _build_usage_tab(self, parent):
+        page = ScrollFrame(parent, bg=BG, height=1)
+        page.pack(fill="both", expand=True, padx=20, pady=16)
+        grid = tk.Frame(page.inner, bg=BG); grid.pack(fill="both", expand=True)
+        for i in range(2):
+            grid.grid_columnconfigure(i, weight=1, uniform="usage_cards")
+
+        def cell(row, col):
+            f = tk.Frame(grid, bg=BG)
+            f.grid(row=row, column=col, sticky="nsew", padx=(0 if col == 0 else 6, 0 if col == 1 else 6),
+                  pady=(0 if row == 0 else 6, 0 if row == 1 else 6))
+            return f
+
+        # --- CPU: card + per-core mini bar chart ---
+        cpu_cell = cell(0, 0)
+        self.cpu_load_card = MetricCard(cpu_cell, "CPU UTILIZATION", "%", GREEN, CPU_LOAD_ZONES[1][0], 100,
+                                        zone_fn=lambda v: zone_for(v, CPU_LOAD_ZONES),
+                                        ticks=[(CPU_LOAD_ZONES[1][0], AMBER), (CPU_LOAD_ZONES[0][0], RED)])
+        self.cpu_load_card.pack(fill="x")
+        self.cpu_load_card.set_footer(f"{CPU_LOAD_ZONES[1][0]:.0f} WARN · {CPU_LOAD_ZONES[0][0]:.0f} CRIT")
+        core_panel = Panel(cpu_cell, f"PER-CORE LOAD · {LOGICAL_CPU_COUNT} THREADS")
+        core_panel.pack(fill="x", pady=(8, 0))
+        core_chart = tk.Frame(core_panel.body, bg=PANEL, height=40); core_chart.pack(fill="x", pady=(0, 4))
+        core_chart.pack_propagate(False)
+        self.core_bars = []
+        for i in range(LOGICAL_CPU_COUNT):
+            wrap = tk.Frame(core_chart, bg=BORDER2); wrap.place(relx=i / LOGICAL_CPU_COUNT, rely=0,
+                            relwidth=1 / LOGICAL_CPU_COUNT, relheight=1)
+            bar = tk.Frame(wrap, bg=BLUE); bar.place(relx=0.15, rely=1, relwidth=0.7, relheight=0, anchor="sw")
+            self.core_bars.append(bar)
+
+        # --- Memory: card + composition bar + legend ---
+        mem_cell = cell(0, 1)
+        self.mem_load_card = MetricCard(mem_cell, "MEMORY UTILIZATION", "%", BLUE, MEM_LOAD_ZONES[1][0], 100,
+                                        zone_fn=lambda v: zone_for(v, MEM_LOAD_ZONES),
+                                        ticks=[(MEM_LOAD_ZONES[1][0], AMBER), (MEM_LOAD_ZONES[0][0], RED)])
+        self.mem_load_card.pack(fill="x")
+        self.mem_load_card.set_footer(f"{MEM_LOAD_ZONES[1][0]:.0f} WARN · {MEM_LOAD_ZONES[0][0]:.0f} CRIT")
+        mem_panel = Panel(mem_cell, "COMPOSITION")
+        mem_panel.pack(fill="x", pady=(8, 0))
+        comp_wrap = tk.Frame(mem_panel.body, bg=BORDER2, height=20); comp_wrap.pack(fill="x", pady=(0, 8))
+        comp_wrap.pack_propagate(False)
+        mem_segment_colors = {"in_use": BLUE, "modified": ORANGE, "standby": GREEN, "free": BORDER}
+        self.mem_segments = {key: tk.Frame(comp_wrap, bg=color) for key, color in mem_segment_colors.items()}
+        legend_row = tk.Frame(mem_panel.body, bg=PANEL); legend_row.pack(fill="x")
+        self.mem_legend_labels = {}
+        for key, label in (("in_use", "In use"), ("modified", "Modified"), ("standby", "Standby"), ("free", "Free")):
+            item = tk.Frame(legend_row, bg=PANEL); item.pack(side="left", padx=(0, 14))
+            tk.Frame(item, bg=mem_segment_colors[key], width=8, height=8).pack(side="left", pady=(0, 1))
+            lbl = tk.Label(item, text=f"{label} --", bg=PANEL, fg=TEXT, font=(MONO, 8))
+            lbl.pack(side="left", padx=(5, 0))
+            self.mem_legend_labels[key] = lbl
+
+        # --- Disk: card + per-drive rows (_sync_rows, drive count is genuinely variable) ---
+        disk_cell = cell(1, 0)
+        self.disk_activity_card = MetricCard(disk_cell, "DISK ACTIVITY", "%", BLUE, DISK_ACTIVITY_ZONES[1][0], 100,
+                                             zone_fn=lambda v: zone_for(v, DISK_ACTIVITY_ZONES),
+                                             ticks=[(DISK_ACTIVITY_ZONES[1][0], AMBER), (DISK_ACTIVITY_ZONES[0][0], RED)])
+        self.disk_activity_card.pack(fill="x")
+        self.disk_activity_card.set_footer(f"{DISK_ACTIVITY_ZONES[1][0]:.0f} WARN · {DISK_ACTIVITY_ZONES[0][0]:.0f} CRIT")
+        disk_panel = Panel(disk_cell, "PER-DRIVE ACTIVITY")
+        disk_panel.pack(fill="x", pady=(8, 0))
+        self.disk_activity_body = tk.Frame(disk_panel.body, bg=PANEL)
+        self.disk_activity_body.pack(fill="both", expand=True)
+
+        # --- GPU: card + 4 fixed engine-type rows (never disappear when idle) ---
+        gpu_cell = cell(1, 1)
+        self.gpu_load_card = MetricCard(gpu_cell, "GPU UTILIZATION", "%", GREEN, GPU_LOAD_ZONES[1][0], 100,
+                                        zone_fn=lambda v: zone_for(v, GPU_LOAD_ZONES),
+                                        ticks=[(GPU_LOAD_ZONES[1][0], AMBER), (GPU_LOAD_ZONES[0][0], RED)])
+        self.gpu_load_card.pack(fill="x")
+        self.gpu_load_card.set_footer(f"{GPU_LOAD_ZONES[1][0]:.0f} WARN · {GPU_LOAD_ZONES[0][0]:.0f} CRIT")
+        gpu_eng_panel = Panel(gpu_cell, "ENGINES")
+        gpu_eng_panel.pack(fill="x", pady=(8, 0))
+        self.gpu_engine_rows = {}
+        for key, label in self.GPU_ENGINE_DISPLAY:
+            row = tk.Frame(gpu_eng_panel.body, bg=PANEL); row.pack(fill="x", pady=3)
+            tk.Label(row, text=label, bg=PANEL, fg=TEXT, font=(MONO, 9), width=13, anchor="w").pack(side="left")
+            bar_wrap = tk.Frame(row, bg=BORDER2, height=6); bar_wrap.pack(side="left", fill="x", expand=True, padx=(0, 8))
+            bar_wrap.pack_propagate(False)
+            bar = tk.Frame(bar_wrap, bg=BLUE); bar.place(relx=0, rely=0, relwidth=0, relheight=1)
+            val_lbl = tk.Label(row, text="0.0%", bg=PANEL, fg=MUTED, font=(MONO, 9), width=6, anchor="e")
+            val_lbl.pack(side="left")
+            self.gpu_engine_rows[key] = {"bar": bar, "value": val_lbl}
+
+    def _update_usage_tab(self):
+        cpu_avg = self.cpu_load_sum / self.cpu_load_n if self.cpu_load_n else 0
+        mem_avg = self.mem_load_sum / self.mem_load_n if self.mem_load_n else 0
+        disk_avg = self.disk_activity_sum / self.disk_activity_n if self.disk_activity_n else 0
+        gpu_avg = self.gpu_load_sum / self.gpu_load_n if self.gpu_load_n else 0
+
+        self.cpu_load_card.update_value(self.last_cpu_load_pct, "NOMINAL", self.cpu_load_peak, cpu_avg,
+                                        self.last_cpu_load_pct / 100)
+        self.mem_load_card.update_value(self.last_mem_load_pct, "NOMINAL", self.mem_load_peak, mem_avg,
+                                        self.last_mem_load_pct / 100)
+        disk_max_now = max((r["pct"] for r in self.last_disk_activity), default=0.0)
+        self.disk_activity_card.update_value(disk_max_now, "NOMINAL", self.disk_activity_peak, disk_avg,
+                                             disk_max_now / 100)
+        self.gpu_load_card.update_value(self.last_gpu_load_pct, "NOMINAL", self.gpu_load_peak, gpu_avg,
+                                        (self.last_gpu_load_pct or 0) / 100 if self.last_gpu_load_pct is not None else None)
+
+        # per-core mini bars
+        for i, bar in enumerate(self.core_bars):
+            pct = self.last_cpu_cores[i] if i < len(self.last_cpu_cores) and self.last_cpu_cores[i] is not None else 0.0
+            color = RED if pct >= 85 else AMBER if pct >= 65 else BLUE
+            bar.config(bg=color)
+            bar.place(relheight=max(0.03, min(1.0, pct / 100)))
+
+        # memory composition segments + legend
+        comp = self.last_mem_composition
+        mem_total_bytes = self.last_mem_total_bytes
+        mem_seg_labels = {"in_use": "In use", "modified": "Modified", "standby": "Standby", "free": "Free"}
+        if comp and mem_total_bytes:
+            standby = comp.get("standby_bytes", 0.0)
+            modified = comp.get("modified_bytes", 0.0)
+            free = comp.get("free_bytes", 0.0)
+            in_use = max(0.0, mem_total_bytes - standby - modified - free)
+            segs = [("in_use", in_use), ("modified", modified), ("standby", standby), ("free", free)]
+            x = 0.0
+            for key, bytes_val in segs:
+                w = max(0.0, bytes_val / mem_total_bytes)
+                self.mem_segments[key].place(relx=x, rely=0, relwidth=w, relheight=1)
+                x += w
+                self.mem_legend_labels[key].config(text=f"{mem_seg_labels[key]} {fmt_net_bytes(bytes_val)}")
+        else:
+            for f in self.mem_segments.values():
+                f.place(relx=0, rely=0, relwidth=0, relheight=1)
+
+        # per-drive rows
+        def build_disk_row(parent):
+            row = tk.Frame(parent, bg=PANEL); row.pack(fill="x", pady=3)
+            lbl = tk.Label(row, bg=PANEL, fg=TEXT, font=(MONO, 9), width=16, anchor="w"); lbl.pack(side="left")
+            bar_wrap = tk.Frame(row, bg=BORDER2, height=6); bar_wrap.pack(side="left", fill="x", expand=True, padx=(0, 8))
+            bar_wrap.pack_propagate(False)
+            bar = tk.Frame(bar_wrap, bg=GREEN); bar.place(relx=0, rely=0, relwidth=0, relheight=1)
+            val = tk.Label(row, bg=PANEL, fg=MUTED, font=(MONO, 9), width=6, anchor="e"); val.pack(side="left")
+            return {"frame": row, "label": lbl, "bar": bar, "value": val}
+
+        disk_specs = []
+        for r in self.last_disk_activity:
+            def update_disk_row(refs, r=r):
+                refs["label"].config(text=r["label"])
+                refs["bar"].place(relwidth=max(0.0, min(1.0, r["pct"] / 100)))
+                refs["value"].config(text=f"{r['pct']:.0f}%")
+            disk_specs.append((r["disk_idx"], build_disk_row, update_disk_row))
+        self._sync_rows(self.disk_activity_rows, self.disk_activity_body, disk_specs)
+
+        # GPU engine rows - fixed set, never destroyed, default to 0 when idle/absent
+        for key, _label in self.GPU_ENGINE_DISPLAY:
+            pct = self.last_gpu_engines.get(key, 0.0)
+            refs = self.gpu_engine_rows[key]
+            refs["bar"].place(relwidth=max(0.0, min(1.0, pct / 100)))
+            refs["value"].config(text=f"{pct:.1f}%")
 
     def _style_range_buttons(self):
         for label, b in self.range_buttons.items():
@@ -9837,6 +11115,9 @@ class App(tk.Tk):
         prev_proc_times = {}
         prev_sample_time = time.time()
         gpu_sampler = GpuProcessSampler()
+        cpu_core_sampler = CpuCoreSampler()
+        mem_comp_sampler = MemoryCompositionSampler()
+        disk_sampler = PhysicalDiskSampler()
         # Network: prev_net carries the previous tick's (adapter index, byte counters, time) so
         # active_network_snapshot() can compute a real Mbps rate - same "keep last sample on this
         # thread" pattern as prev_proc_times above, never touched by the Tk main thread. IP/
@@ -9855,11 +11136,16 @@ class App(tk.Tk):
         # already resolved once (e.g. a long-lived browser holding dozens of connections) never
         # pays a fresh OpenProcess/QueryFullProcessImageNameW per tick - see active_connections().
         conn_name_cache = {}
+        last_lhm_for_gpu = []
+        intel_sampler = IntelD3DKMTTemperatureSampler()
         while not self.stop_event.is_set():
             old_idle, old_total = self.last_cpu; now = cpu_times(); self.last_cpu = now
             dt = now[1] - old_total; load = 100 * (1 - (now[0] - old_idle) / dt) if dt else 0
-            mem_pct, mem_used, mem_total = memory(); gpus = nvidia_stats()
+            mem_pct, mem_used, mem_total = memory()
             lhm = lhm_sensors() if tick % 2 == 0 else None
+            if lhm is not None:
+                last_lhm_for_gpu = lhm
+            gpus = gpu_stats(last_lhm_for_gpu, intel_sampler)
 
             net, prev_net = active_network_snapshot(prev_net)
             net_idx = net["adapter"]["index"] if net["adapter"] else None
@@ -9880,28 +11166,73 @@ class App(tk.Tk):
             connections = active_connections(conn_name_cache)
 
             sample_time = time.time()
-            curr_proc_times = _sample_process_cpu_times()
-            cpu_top = cpu_top_processes(prev_proc_times, curr_proc_times, sample_time - prev_sample_time)
-            names_by_pid = {pid: name for pid, (name, _) in curr_proc_times.items()}
-            gpu_top = gpu_top_processes(gpu_sampler.sample(), names_by_pid)
+            curr_proc_times = _sample_process_stats()
+            dt = sample_time - prev_sample_time
+            cpu_top = cpu_top_processes(prev_proc_times, curr_proc_times, dt)
+            names_by_pid = {pid: name for pid, (name, *_rest) in curr_proc_times.items()}
+            if gpu_sampler.collect():
+                gpu_sample = gpu_sampler.sample_by_pid()
+                gpu_engine_sample = gpu_sampler.sample_by_engine()
+            else:
+                gpu_sample, gpu_engine_sample = {}, {}
+            gpu_top = gpu_top_processes(gpu_sample, names_by_pid)
+            apps_top = build_apps_table(prev_proc_times, curr_proc_times, dt, gpu_sample)
+            cpu_cores = cpu_core_sampler.sample()
+            mem_composition = mem_comp_sampler.sample()
+            disk_activity = disk_sampler.sample()
             workload = {"time": sample_time, "foreground": foreground_process(),
                        "cpu_top": cpu_top, "gpu_top": gpu_top}
             prev_proc_times, prev_sample_time = curr_proc_times, sample_time
 
-            self.q.put({"time": datetime.now(), "cpu_load": load, "mem_pct": mem_pct, "mem_used": mem_used,
+            snapshot = {"time": datetime.now(), "cpu_load": load, "mem_pct": mem_pct, "mem_used": mem_used,
                         "mem_total": mem_total, "gpus": gpus, "lhm": lhm, "workload": workload, "net": net,
-                        "net_procs": net_procs, "connections": connections})
+                        "cpu_cores": cpu_cores, "mem_composition": mem_composition,
+                        "disk_activity": disk_activity, "gpu_engines": gpu_engine_sample,
+                        "net_procs": net_procs, "connections": connections, "apps_top": apps_top}
+            try:
+                self.q.put_nowait(snapshot)
+            except queue.Full:
+                try:
+                    self.q.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self.q.put_nowait(snapshot)
+                except queue.Full:
+                    pass
             tick += 1
             self.stop_event.wait(POLL_SECONDS)
+        intel_sampler.close()
 
     def poll(self):
+        # Drain to the newest snapshot only. Historical/aggregate telemetry is updated from the
+        # latest real observation; stale queued UI frames are never worth replaying after a stall.
+        latest = None
         try:
             while True:
-                self.update_data(self.q.get_nowait())
+                latest = self.q.get_nowait()
         except queue.Empty:
             pass
-        if not self.stop_event.is_set():
-            self.after(200, self.poll)
+
+        try:
+            if latest is not None:
+                self.update_data(latest)
+        except Exception as exc:
+            # A single widget/data regression must never permanently cancel Tk's recurring poll.
+            # Preserve the full traceback on disk so the exact failing line can be fixed.
+            try:
+                with data_path("thermal_watch_poll_errors.log").open("a", encoding="utf-8") as f:
+                    f.write(f"\n[{datetime.now().isoformat()}] {type(exc).__name__}: {exc}\n")
+                    f.write(traceback.format_exc())
+            except OSError:
+                pass
+            try:
+                self.log_event("ERROR", f"Dashboard refresh failed: {type(exc).__name__}: {exc}")
+            except (OSError, tk.TclError, ValueError, TypeError):
+                pass
+        finally:
+            if not self.stop_event.is_set():
+                self.after(200, self.poll)
 
     def tick_uptime(self):
         self.uptime_label.config(text=f"UPTIME {fmt_hms(time.time() - self.start_time)}")
@@ -9920,15 +11251,20 @@ class App(tk.Tk):
 
         if health in ("STALE", "MISSING", "ERROR"):
             now = time.time()
-            if now - self.last_bridge_recovery_attempt >= BRIDGE_RECOVERY_MIN_INTERVAL_S:
+            bridge_pid = status.get("pid") if status else None
+            bridge_alive = bool(bridge_pid and _process_exists(bridge_pid))
+            if bridge_alive:
+                # A live-but-stale elevated bridge usually means LHM is wedged inside a hardware
+                # Update() call. Starting replacements cannot win the global mutex and only causes
+                # repeated UAC prompts. Stay responsive and wait for an explicit/admin restart.
+                self.bridge_health = health
+            elif now - self.last_bridge_recovery_attempt >= BRIDGE_RECOVERY_MIN_INTERVAL_S:
                 self.last_bridge_recovery_attempt = now
                 if spawn_bridge_recovery():
                     self.bridge_health = "RESTARTING"
-                    self.log_event("INFO", "Sensor bridge stale/unavailable - attempting automatic recovery")
+                    self.log_event("INFO", "Sensor bridge unavailable - attempting automatic recovery")
                 else:
                     self.bridge_health = health
-            # else: recovery was already attempted recently: keep reporting the real
-            # health rather than sitting in RESTARTING forever if it didn't come back.
             elif self.bridge_health == "RESTARTING" and now - self.last_bridge_recovery_attempt > 15:
                 self.bridge_health = health
         else:
@@ -10335,7 +11671,8 @@ class App(tk.Tk):
             },
             "live": {
                 "cpu": {"temp_c": ctx.get("cpu_temp"), "load_pct": ctx.get("cpu_load"),
-                       "power_w": ctx.get("cpu_power"), "fan_rpm": ctx.get("cpu_fan_rpm")},
+                       "power_w": ctx.get("cpu_power"), "fan_rpm": ctx.get("cpu_fan_rpm"),
+                       "effective_clock_mhz": ctx.get("cpu_effective_clock_mhz")},
                 "gpu": {"core_temp_c": ctx.get("gpu_core_temp"), "hotspot_temp_c": ctx.get("gpu_hotspot_temp"),
                        "vram_temp_c": ctx.get("gpu_vram_temp"), "load_pct": ctx.get("gpu_load"),
                        "power_w": ctx.get("gpu_power"), "vram_used_mb": ctx.get("gpu_vram_used_mb"),
@@ -10364,13 +11701,18 @@ class App(tk.Tk):
                              "coverage_pct": coverage_pct, "gaps": coverage_gaps},
         }
 
-    def _write_evidence_snapshot(self):
+    def _write_evidence_snapshot(self, payload=None):
         """Atomic write (temp file + replace), same pattern as every other store in this app.
         Best-effort and silent on failure: this is optional infrastructure for an external
         reader that may not even exist - a write failure must never affect monitoring itself,
-        the same contract sensors.json's own writer already holds to."""
+        the same contract sensors.json's own writer already holds to.
+
+        payload: pass a pre-built snapshot (as _flush_evidence_periodic does, to avoid building
+        it twice - once for the file, once for the pipe cache) or omit to build one internally,
+        which is what every other caller (e.g. verify_evidence_api.py) still does."""
         try:
-            payload = self._build_evidence_snapshot()
+            if payload is None:
+                payload = self._build_evidence_snapshot()
             tmp = EVIDENCE_SNAPSHOT_PATH.with_suffix(".tmp")
             tmp.write_text(json.dumps(payload), encoding="utf-8")
             tmp.replace(EVIDENCE_SNAPSHOT_PATH)
@@ -10380,8 +11722,140 @@ class App(tk.Tk):
     def _flush_evidence_periodic(self):
         if self.stop_event.is_set():
             return
-        self._write_evidence_snapshot()
+        payload = self._build_evidence_snapshot()
+        self._write_evidence_snapshot(payload=payload)
+        with self._evidence_cache_lock:
+            self._evidence_cache = payload
         self.after(EVIDENCE_SNAPSHOT_INTERVAL_MS, self._flush_evidence_periodic)
+
+    def _refresh_totals_periodic(self):
+        """Recomputes and redraws the totals strip (see compute_totals_summary()). Not run on
+        the 2s poll loop - a real telemetry-file scan is heavier than a single sensor read - same
+        self-rescheduling/stop_event-gated pattern as _flush_evidence_periodic."""
+        if self.stop_event.is_set():
+            return
+        summary = compute_totals_summary(window_days=TOTALS_WINDOW_DAYS)
+        energy_wh = summary["energy_wh"]
+        if energy_wh is None:
+            energy_text = "N/A"
+        elif energy_wh >= 1000:
+            energy_text = f"{energy_wh / 1000:.2f} kWh"
+        else:
+            energy_text = f"{energy_wh:.0f} Wh"
+        self.totals_labels["energy"].config(text=energy_text)
+        cost_mxn = summary["energy_cost_mxn"]
+        self.totals_labels["cost"].config(text="N/A" if cost_mxn is None else f"${cost_mxn:,.2f} MXN")
+        self.totals_labels["down"].config(text=fmt_net_bytes(summary["down_bytes"]))
+        self.totals_labels["up"].config(text=fmt_net_bytes(summary["up_bytes"]))
+        self.totals_labels["monitored"].config(text=fmt_hms(summary["monitored_seconds"]))
+        self.totals_labels["incidents"].config(text=str(summary["incident_count"]))
+        self.totals_labels["sessions"].config(text=str(summary["session_count"]))
+        monitor_cost_mxn = summary["monitor_energy_cost_mxn"]
+        self.totals_labels["monitor_cost"].config(
+            text="N/A" if monitor_cost_mxn is None else f"${monitor_cost_mxn:,.2f} MXN")
+        combined_mxn = summary["combined_cost_mxn"]
+        self.totals_labels["combined_cost"].config(
+            text="N/A" if combined_mxn is None else f"${combined_mxn:,.2f} MXN")
+        self.after(TOTALS_REFRESH_INTERVAL_MS, self._refresh_totals_periodic)
+
+    def _pipe_evidence_loader(self):
+        """loader contract matches thermal_watch_evidence_cli._load_snapshot(): () ->
+        (snapshot_dict_or_None, error_dict_or_None). Reads the cache _flush_evidence_periodic
+        populates on the Tk thread rather than calling _build_evidence_snapshot() again -  that
+        does real disk I/O and reads Tk-thread-owned state (self.last_context/self.incidents_
+        active/etc), so it must never run on a pipe-connection thread directly. A single
+        reference read/write under the lock is enough since _build_evidence_snapshot() always
+        returns a fresh dict rather than mutating the previous one in place."""
+        with self._evidence_cache_lock:
+            snapshot = self._evidence_cache
+        if snapshot is None:
+            return None, {"ok": False, "error": {
+                "code": "evidence_not_ready",
+                "message": "Thermal Watch is starting up; evidence is not yet available",
+            }}
+        return snapshot, None
+
+    def _pipe_history_fetcher(self, component, days):
+        """history_fetcher contract matches thermal_watch_evidence_cli._recent_records():
+        (component, days) -> (rows, coverage_dict_or_None, error_dict_or_None). Only the pipe
+        path can serve a get_recent_incidents/get_recent_sessions request wider than the cached
+        snapshot's embedded 24h window, because only this reads Thermal Watch's full retained
+        history directly - read_incidents_file()/read_sessions_file()/read_telemetry_file() are
+        pure file reads (no Tk-owned state touched), so calling them from a pipe-connection
+        background thread is safe, unlike _build_evidence_snapshot()."""
+        days = max(1, min(int(days), INCIDENT_RETENTION_DAYS))
+        window_s = days * 86400
+        cutoff = time.time() - window_s
+        try:
+            if component == "incidents":
+                rows = [r for r in read_incidents_file() if r.get("end_timestamp", 0) >= cutoff]
+            elif component == "sessions":
+                rows = [r for r in read_sessions_file() if r.get("end_timestamp", 0) >= cutoff]
+            else:
+                return None, None, {"ok": False, "error": {
+                    "code": "invalid_component", "message": "unknown history component"}}
+            buckets = read_telemetry_file(since_ts=cutoff)
+            valid_buckets, expected_buckets, coverage_pct = compute_coverage(buckets, window_s)
+        except OSError:
+            return None, None, {"ok": False, "error": {
+                "code": "history_unavailable", "message": "Thermal Watch history could not be read"}}
+        coverage = {"valid_buckets": valid_buckets, "expected_buckets": expected_buckets,
+                    "coverage_pct": coverage_pct, "window_days": days}
+        return rows, coverage, None
+
+    def _pipe_experiments_fetcher(self, experiment_id):
+        """experiments_fetcher contract matches thermal_watch_evidence_cli._experiments_response():
+        (experiment_id_or_None) -> (result, error_dict_or_None). experiment_id is None -> result
+        is the raw marker list (read_experiments_file()). experiment_id is a real marker's id ->
+        result is compute_experiment_report()'s dict for that one marker, with EXPERIMENT_CAVEAT
+        folded in - this is the one place that constant is attached, since thermal_watch_evidence_
+        cli.py deliberately has zero coupling to app.py and just passes through whatever this
+        fetcher returns. read_experiments_file()/compute_experiment_report() only touch pure file
+        reads (sessions/telemetry/experiments stores), same thread-safety class as
+        _pipe_history_fetcher - safe to call from a pipe-connection background thread."""
+        try:
+            markers = read_experiments_file()
+        except OSError:
+            return None, {"ok": False, "error": {
+                "code": "history_unavailable", "message": "Thermal Watch experiment markers could not be read"}}
+        if experiment_id is None:
+            return markers, None
+        match = next((m for m in markers if m.get("experiment_id") == experiment_id), None)
+        if match is None:
+            return None, {"ok": False, "error": {
+                "code": "unknown_experiment_id", "message": "no experiment marker with that id"}}
+        try:
+            report = dict(compute_experiment_report(match))
+        except OSError:
+            return None, {"ok": False, "error": {
+                "code": "history_unavailable",
+                "message": "Thermal Watch history could not be read to build this report"}}
+        report["caveat"] = EXPERIMENT_CAVEAT
+        return report, None
+
+    def _handle_evidence_pipe_request(self, request):
+        """Entry point EvidencePipeServer calls (from a per-connection background thread) for
+        every pipe request. Delegates to the exact same validation/dispatch/formatting logic the
+        file-based CLI uses, sourced from the live cache instead of disk."""
+        return evidence_cli.handle_request(request, loader=self._pipe_evidence_loader,
+                                            history_fetcher=self._pipe_history_fetcher,
+                                            experiments_fetcher=self._pipe_experiments_fetcher)
+
+    def _log_pipe_event(self, kind, text, meta=None):
+        """Thread-safe logging sink for EvidencePipeServer, which logs from background threads
+        (the accept loop and per-connection handlers). log_event() itself is Tk-thread-only - it
+        mutates self.events (a plain deque, not thread-safe) and touches real Tk widgets via
+        _append_log_row() - so this deliberately does only the JSONL-append half of log_event(),
+        which is plain file I/O and safe from any thread. Pipe lifecycle/error events land in
+        EVENT_LOG_PATH for diagnosis but do not appear in the in-app event feed."""
+        try:
+            record = {"ts": time.time(), "kind": kind, "text": text}
+            if meta:
+                record["meta"] = meta
+            with EVENT_LOG_PATH.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+        except OSError:
+            pass
 
     # -- workload session tracking (see the module-level design note near SESSION_* consts) ---
     def load_sessions(self):
@@ -11211,6 +12685,35 @@ class App(tk.Tk):
         elif "cpu" in self.active_alerts:
             self.active_alerts["cpu"]["text"] = self._cpu_alert_text(raw_key, ct)
 
+    def _maybe_alert_nox(self, ct):
+        """Sustained-duration check (NOX_ALERT_SUSTAINED_S), independent of the UI's own zone
+        debounce above - fires _send_nox_thermal_alert at most once per excursion above
+        NOX_ALERT_TEMP_C, re-arming only once the temp recovers below NOX_ALERT_RECOVER_C
+        (hysteresis, so it can't fire again every tick while hovering right at the threshold)."""
+        if ct is None:
+            return
+        now = time.time()
+        if ct >= NOX_ALERT_TEMP_C:
+            if self.nox_alert_pending_since is None:
+                self.nox_alert_pending_since = now
+            elif self.nox_alert_armed and now - self.nox_alert_pending_since >= NOX_ALERT_SUSTAINED_S:
+                self.nox_alert_armed = False
+                a = self._current_attribution("cpu")
+                threading.Thread(
+                    target=_send_nox_thermal_alert,
+                    args=(ct, a["top_cpu_processes"], a["foreground_process"]),
+                    daemon=True,
+                ).start()
+                self.log_event(
+                    "CRIT",
+                    f"CPU package {ct:.1f}°C sustained ≥{NOX_ALERT_TEMP_C:.0f}°C for "
+                    f"{NOX_ALERT_SUSTAINED_S:.0f}s — alerted Nox AI",
+                    meta={"component": "cpu", "value": ct, "threshold": NOX_ALERT_TEMP_C})
+        else:
+            self.nox_alert_pending_since = None
+            if ct < NOX_ALERT_RECOVER_C:
+                self.nox_alert_armed = True
+
     @staticmethod
     def _drive_alert_text(name, zone_key, temp):
         label = next(z[3] for z in DRIVE_ZONES if z[1] == zone_key)
@@ -11650,6 +13153,11 @@ class App(tk.Tk):
             self.last_foreground = workload["foreground"]
             self.last_cpu_top = workload["cpu_top"]
             self.last_gpu_top = workload["gpu_top"]
+        self.last_apps_top = d.get("apps_top") or []
+        self.last_cpu_cores = d.get("cpu_cores") or []
+        self.last_mem_composition = d.get("mem_composition") or {}
+        self.last_disk_activity = d.get("disk_activity") or []
+        self.last_gpu_engines = d.get("gpu_engines") or {}
 
         if d["lhm"] is not None:
             self._lhm = d["lhm"]
@@ -11672,9 +13180,14 @@ class App(tk.Tk):
         package = next((s for s in temps if any(k in s.get("Name", "").lower() for k in ("package", "tctl", "tdie"))),
                        temps[0] if temps else None)
         ct = float(package["Value"]) if package and package.get("Value") not in (None, 0) else None
+        effective_clock_mhz = cpu_effective_clock_mhz(sensors)
 
         gpu = d["gpus"][0] if d["gpus"] else {}
         gt = gpu.get("temp")
+        intel_gpu = next((g for g in d.get("gpus", []) if g.get("vendor") == "intel"), {})
+        arc_temp = intel_gpu.get("temp")
+        arc_max = intel_gpu.get("temp_max")
+        arc_warning = intel_gpu.get("temp_warning")
         gpu_short = gpu.get("name", "GPU").replace("NVIDIA GeForce ", "").replace("NVIDIA ", "").strip() or "GPU"
         mem_pct = d["mem_pct"]
 
@@ -11683,12 +13196,41 @@ class App(tk.Tk):
             self.cpu_peak = max(self.cpu_peak, ct); self.cpu_sum += ct; self.cpu_n += 1
         if gt is not None:
             self.gpu_peak = max(self.gpu_peak, gt); self.gpu_sum += gt; self.gpu_n += 1
+        if arc_temp is not None:
+            self.arc_peak = max(self.arc_peak, arc_temp); self.arc_sum += arc_temp; self.arc_n += 1
         cpu_avg = self.cpu_sum / self.cpu_n if self.cpu_n else 0
         gpu_avg = self.gpu_sum / self.gpu_n if self.gpu_n else 0
+        arc_avg = self.arc_sum / self.arc_n if self.arc_n else 0
 
         self.cpu_card.update_value(ct, "NOMINAL", self.cpu_peak, cpu_avg, (ct or 0) / TJMAX if ct is not None else None)
         self.gpu_card.update_value(gt, "NOMINAL", self.gpu_peak, gpu_avg, (gt or 0) / GPU_TMAX if gt is not None else None)
+        if arc_max is not None and arc_max > 0:
+            self.arc_card.set_scale_max(arc_max)
+            warning_note = f" \u00b7 WARN {arc_warning:.0f}\u00b0C" if arc_warning else ""
+            self.arc_card.set_footer(f"WINDOWS WDDM SENSOR \u00b7 DRIVER MAX {arc_max:.0f}\u00b0C{warning_note}")
+        else:
+            self.arc_card.set_scale_max(None)
+            self.arc_card.set_footer("WINDOWS WDDM SENSOR \u00b7 DRIVER THERMAL LIMIT UNAVAILABLE")
+        self.arc_card.update_value(
+            arc_temp, "LIVE", self.arc_peak, arc_avg,
+            arc_temp / arc_max if arc_temp is not None and arc_max is not None and arc_max > 0 else None)
         self.mem_card.update_value(mem_pct, "NOMINAL", mem_pct, mem_pct, mem_pct / 100)
+
+        # USAGE tab headline scalars - stashed as self.last_* (matching the file's existing
+        # convention, e.g. self.last_net/self.last_foreground) rather than passed as args, so
+        # _update_usage_tab() can read them the same way _update_apps_tab() reads self.last_apps_top.
+        cpu_load_pct = d["cpu_load"]
+        gpu_load_pct = gpu.get("load")
+        self.last_cpu_load_pct = cpu_load_pct
+        self.last_mem_load_pct = mem_pct
+        self.last_gpu_load_pct = gpu_load_pct
+        self.last_mem_total_bytes = d["mem_total"] * (2 ** 30)  # mem_total is GB (memory(), app.py:4896)
+        self.cpu_load_peak = max(self.cpu_load_peak, cpu_load_pct); self.cpu_load_sum += cpu_load_pct; self.cpu_load_n += 1
+        self.mem_load_peak = max(self.mem_load_peak, mem_pct); self.mem_load_sum += mem_pct; self.mem_load_n += 1
+        if gpu_load_pct is not None:
+            self.gpu_load_peak = max(self.gpu_load_peak, gpu_load_pct); self.gpu_load_sum += gpu_load_pct; self.gpu_load_n += 1
+        disk_max_pct = max((r["pct"] for r in self.last_disk_activity), default=0.0)
+        self.disk_activity_peak = max(self.disk_activity_peak, disk_max_pct); self.disk_activity_sum += disk_max_pct; self.disk_activity_n += 1
 
         # stat strip
         self.stat_labels["cpu_load"].config(text=f"{d['cpu_load']:.0f}%")
@@ -11699,7 +13241,13 @@ class App(tk.Tk):
         self.stat_labels["gpu_power"].config(
             text=f"{gpu.get('power', 0):.0f} / {gpu.get('power_limit', 0):.0f} W" if gpu else "N/A")
         cpu_power = find("Power", lambda s: "package" in s.get("Name", "").lower() and "cpu" in s.get("Parent", "").lower())
-        self.stat_labels["cpu_power"].config(text=f"{float(cpu_power[0]['Value']):.0f} W" if cpu_power else "N/A")
+        cpu_power_value = None
+        if cpu_power and cpu_power[0].get("Value") is not None:
+            try:
+                cpu_power_value = float(cpu_power[0]["Value"])
+            except (TypeError, ValueError):
+                cpu_power_value = None
+        self.stat_labels["cpu_power"].config(text=f"{cpu_power_value:.0f} W" if cpu_power_value is not None else "N/A")
 
         # fans - CPU Fan is the only one Thermal Watch makes a health call on (0 RPM while CPU
         # is hot); GPU/chassis/pump 0 RPM is legitimate (idle zero-RPM mode / unpopulated
@@ -11837,7 +13385,7 @@ class App(tk.Tk):
         telemetry_sensor_samples = []
 
         disk_specs = []
-        for dsk in disk_temps[:4]:
+        for dsk in disk_temps:
             drive_key = dsk.get("Parent", "DISK")
             drive_name = drive_key.replace("Storage ", "").strip()
             raw = dsk.get("Value")
@@ -11894,8 +13442,10 @@ class App(tk.Tk):
         # once here since every value it needs is already computed by this point; any active
         # incident's _incident_touch() reads this same dict, never invents a missing value.
         self.last_context = {
-            "cpu_temp": ct, "gpu_core_temp": gt, "gpu_hotspot_temp": hotspot, "gpu_vram_temp": vram,
-            "cpu_power": float(cpu_power[0]["Value"]) if cpu_power else None,
+            "cpu_temp": ct, "gpu_core_temp": gt, "arc_core_temp": arc_temp,
+            "gpu_hotspot_temp": hotspot, "gpu_vram_temp": vram,
+            "cpu_effective_clock_mhz": effective_clock_mhz,
+            "cpu_power": cpu_power_value,
             "gpu_power": gpu.get("power"),
             "cpu_load": d.get("cpu_load"),
             "gpu_load": gpu.get("load"),
@@ -11915,6 +13465,8 @@ class App(tk.Tk):
         }
         self._update_network_panel()
         self._update_network_process_list()
+        self._update_apps_tab()
+        self._update_usage_tab()
 
         def build_zone_row(parent):
             row = tk.Frame(parent, bg=PANEL); row.pack(fill="x", pady=3)
@@ -12041,6 +13593,7 @@ class App(tk.Tk):
         # alert engine
         self._update_cpu_zone(ct)
         self._incident_observe("cpu", "cpu", "CPU Package", package.get("Identifier") if package else None, ct)
+        self._maybe_alert_nox(ct)
         self._check_alert("mem", mem_pct >= THRESH_MEM, f"System memory {mem_pct:.0f}%, above {THRESH_MEM:.0f}% threshold",
                           value=mem_pct, bias="cpu")
         # (drive/GPU-sub-sensor/RAM/CPU-fan alerting happens per-sensor above, inside their own render loops)
@@ -12172,7 +13725,8 @@ class App(tk.Tk):
     _RECURRING_AFTER_METHODS = ("poll", "tick_uptime", "check_bridge_health",
                                 "_reconcile_restored_incidents", "_flush_active_incidents_periodic",
                                 "_reconcile_restored_sessions", "_flush_active_sessions_periodic",
-                                "_check_due_reports", "_flush_evidence_periodic")
+                                "_check_due_reports", "_flush_evidence_periodic",
+                                "_refresh_totals_periodic")
 
     def destroy(self):
         """Cancels App's own pending recurring after() callbacks and joins worker() before
@@ -12218,6 +13772,9 @@ class App(tk.Tk):
                     self.after_cancel(after_id)
         except tk.TclError:
             pass  # interpreter already gone - nothing to cancel, not an error
+        pipe_server = getattr(self, "evidence_pipe_server", None)
+        if pipe_server is not None:
+            pipe_server.stop(timeout=2.0)
         worker_thread = getattr(self, "worker_thread", None)
         if worker_thread is not None and worker_thread.is_alive():
             worker_thread.join(timeout=POLL_SECONDS + 2)
@@ -12226,4 +13783,13 @@ class App(tk.Tk):
 
 if __name__ == "__main__":
     if os.name != "nt": raise SystemExit("Thermal Watch currently supports Windows.")
+    # Without this, Windows groups the taskbar button by the pythonw.exe process itself and
+    # shows Python's own icon there - regardless of what App.__init__'s iconbitmap() sets on the
+    # window (which is why the title bar/Alt-Tab thumbnail were already correct while the
+    # taskbar button wasn't). Must be set before the first window is created; a fixed app-
+    # specific id is enough for Windows to treat this as its own taskbar identity.
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ThermalWatch.App")
+    except OSError:
+        pass
     App().mainloop()

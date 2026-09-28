@@ -1,0 +1,3 @@
+# Build-only dependency for the Windows release pipeline.
+# Runtime remains Python-standard-library-only plus bundled hardware-monitoring binaries.
+PyInstaller==6.22.3

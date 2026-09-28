@@ -11,15 +11,15 @@
 
 **Live thermals • Incident history • Workload attribution • Network Intelligence • Trends • Reports • Evidence-based diagnostics • Optional AI analysis**
 
-## [Download Thermal Watch v1.1.0 for Windows](https://github.com/Artha2020/Thermal-Watch/releases/tag/v1.1.0)
+## [Download Thermal Watch v1.1.1 for Windows](https://github.com/Artha2020/Thermal-Watch/releases/tag/v1.1.1)
 
 Thermal Watch combines live sensor data with persistent telemetry, incidents, workload sessions, timelines, reports, network activity, and trend analysis. It is designed to examine recorded thermal behavior without presenting guesses as measurements.
 
 Version 1.1.0 was developed and validated around the project's current target PC. Sensor availability and labeling depend on hardware, firmware, drivers, privileges, vendor tools, and LibreHardwareMonitor support; this release does not claim universal hardware compatibility.
 
-Thermal Watch collects and preserves deterministic hardware evidence and remains the sole authority for what was actually measured. An AI assistant can now optionally query that evidence directly through a bounded, read-only interface — see [Available now in v1.1.0](#available-now-in-v110) below. Thermal Watch itself bundles no AI model and works fully without one.
+Thermal Watch collects and preserves deterministic hardware evidence and remains the sole authority for what was actually measured. An AI assistant can now optionally query that evidence directly through a bounded, read-only interface — see [Available now in v1.1.1](#available-now-in-v110) below. Thermal Watch itself bundles no AI model and works fully without one.
 
-### Available now in v1.1.0
+### Available now in v1.1.1
 
 - Deterministic live hardware monitoring and persistent telemetry
 - Thermal incidents, workload sessions, history, timelines, analytics, trends, and reports
@@ -37,7 +37,7 @@ Thermal Watch collects and preserves deterministic hardware evidence and remains
 - Self-service AI-assisted **hardware setup**, using a sanitized diagnostic package and provider-neutral compatibility profiles, for machines where built-in detection is incomplete
 - Strict local validation and explicit user approval before any hardware-compatibility profile is activated
 
-This hardware-setup workflow remains roadmap work, not a feature in the current v1.1.0 release — see [AI-assisted setup](docs/AI_SETUP.md) and [AI compatibility protocol](docs/AI_COMPATIBILITY_PROTOCOL.md) for the design. It is unrelated to the AI Analysis/evidence-query integration above, which is real and available now. The design requires no Thermal Watch account, compatibility cloud, diagnostic upload, central AI service, or automatic profile download.
+This hardware-setup workflow remains roadmap work, not a feature in the current v1.1.1 release — see [AI-assisted setup](docs/AI_SETUP.md) and [AI compatibility protocol](docs/AI_COMPATIBILITY_PROTOCOL.md) for the design. It is unrelated to the AI Analysis/evidence-query integration above, which is real and available now. The design requires no Thermal Watch account, compatibility cloud, diagnostic upload, central AI service, or automatic profile download.
 
 **Real, available now — AI Analysis evidence query:**
 
@@ -113,6 +113,7 @@ The application is local and dependency-light at runtime. It uses Windows APIs, 
 
 - CPU package temperature, utilization, clock, and power where available.
 - NVIDIA GPU core temperature, utilization, memory use, clocks, power, and fan percentage through `nvidia-smi`.
+- Intel Arc GPU core temperature through Windows WDDM/D3DKMT when the driver exposes it, with LibreHardwareMonitor metrics retained when available. Thermal limits are shown only when reported by the driver; Thermal Watch does not invent an Arc temperature limit.
 - GPU hotspot and memory-junction temperatures when exposed by LibreHardwareMonitor.
 - Motherboard and chipset temperatures, DIMM/RAM sensors, HDD/SSD/NVMe temperatures, fan speeds, voltages, controls, clocks, and power sensors when the hardware and sensor backend expose them.
 - Live event log, temperature history chart, alert strip, and two-second status updates.
@@ -210,7 +211,7 @@ Deterministic analysis of recorded evidence, including explicit monitoring gaps 
 
 See [`docs/screenshots/README.md`](docs/screenshots/README.md) for capture and privacy requirements. These are real windows from the current public build, not design mockups.
 
-New v1.1.0 screens (Network Intelligence, Ask Thermal Watch's AI Analysis mode, and AI Settings) are not yet captured here and will be added in a follow-up update.
+New v1.1.1 screens (Network Intelligence, Ask Thermal Watch's AI Analysis mode, and AI Settings) are not yet captured here and will be added in a follow-up update.
 
 ## How Thermal Watch Thinks About Evidence
 
@@ -226,13 +227,13 @@ One-minute telemetry buckets include timestamps and sample counts. Coverage calc
 
 - Windows with PowerShell and Tk support.
 - Administrator approval for the sensor bridge when low-level hardware access is needed. The main UI remains unprivileged.
-- A supported Python 3 installation for source runs. The v1.1.0 development build was validated with Python 3.14.
+- A supported Python 3 installation for source runs. The v1.1.1 development build was validated with Python 3.14.
 - `nvidia-smi` on `PATH` for NVIDIA-specific metrics. Thermal Watch continues with the sources that remain available if it is absent.
 - LibreHardwareMonitor support for the motherboard, CPU, GPU, memory, storage, and controller sensors being queried.
 
 Some sensors require administrator access. Some GPUs do not expose hotspot, memory-junction, or fan data. Fan readings may be RPM or percentage depending on the source. Sensor names and availability can change with firmware, drivers, LibreHardwareMonitor versions, or hardware revisions.
 
-Thermal Watch v1.1.0 was tested against the project's current development/target PC and genuine hardware sensors. Other systems should be treated as new validation targets, especially for sensor identity and threshold interpretation.
+Thermal Watch v1.1.1 was tested against the project's current development/target PC and genuine hardware sensors. Other systems should be treated as new validation targets, especially for sensor identity and threshold interpretation.
 
 ## Running Thermal Watch
 
@@ -244,7 +245,7 @@ The PyInstaller onedir build is located at:
 dist\ThermalWatch\ThermalWatch.exe
 ```
 
-Run `ThermalWatch.exe`. The bundle includes `sensor_bridge.ps1`, the application icon, and the LibreHardwareMonitor directory. The executable has no console window. If the privileged bridge is missing or stale, the application can make a rate-limited recovery attempt and may display a UAC prompt.
+Run `ThermalWatch.exe`. The bundle includes `sensor_bridge_v3.ps1`, the application icon, and the LibreHardwareMonitor directory. The executable has no console window. If the privileged bridge is missing or stale, the application can make a rate-limited recovery attempt and may display a UAC prompt.
 
 `dist/` is generated output and is intentionally excluded from Git. Distribute a reviewed build artifact rather than committing the folder to source control.
 
@@ -268,6 +269,17 @@ python .\app.py
 
 That path can still provide metrics available without privileged low-level sensor access, but some CPU, motherboard, fan, voltage, or storage sensors may be unavailable.
 
+## Optional local cost assumptions
+
+Thermal Watch does not ship with a user's electricity tariff or monitor power draw. Cost estimates are opt-in and configured with environment variables:
+
+```powershell
+$env:THERMAL_WATCH_ELECTRICITY_RATE_MXN_PER_KWH = "4.00"
+$env:THERMAL_WATCH_MONITOR_ESTIMATED_WATTS = "60"
+```
+
+If either value is not configured, the related estimate remains unavailable rather than borrowing a machine-specific assumption.
+
 ## Building the Windows executable
 
 PyInstaller is a build-time requirement, not an application runtime dependency. From the repository root:
@@ -282,7 +294,7 @@ The spec uses repository-relative paths and produces:
 dist\ThermalWatch\ThermalWatch.exe
 ```
 
-The build includes `sensor_bridge.ps1`, `thermal_watch.ico`, and the bundled `LibreHardwareMonitor/` directory. `build/` and `dist/` are ignored generated output. Review the complete distribution, third-party notices, and hardware behavior before publishing a binary.
+The build includes `sensor_bridge_v3.ps1`, `thermal_watch.ico`, and the bundled `LibreHardwareMonitor/` directory. `build/` and `dist/` are ignored generated output. Review the complete distribution, third-party notices, and hardware behavior before publishing a binary.
 
 ## Data and privacy
 
@@ -305,11 +317,11 @@ Telemetry, incidents, sessions, and event history use a 30-day retention window.
 
 ## Verification and testing
 
-The repository contains 50 feature verification scripts plus `tools/verify_isolation.py`, which runs the complete verification set (51 scripts total) in redirected temporary data directories and compares production files byte-for-byte before and after the run.
+The repository contains 52 feature verification scripts plus `tools/verify_isolation.py`, for 53 verification scripts total. The isolation gate runs the complete 52-script feature set in redirected temporary data directories and compares production files byte-for-byte before and after the run.
 
-The v1.1.0 release pass reported:
+The v1.1.1 release pass reported:
 
-- 50/50 feature verification scripts passing, including the Network Intelligence and AI provider/settings/grounding suites added since v1.0.1.
+- 52/52 feature verification scripts passing, including the Network Intelligence and AI provider/settings/grounding suites added since v1.0.1.
 - Verification isolation passing with production data unchanged.
 - The packaged executable launching without a console window, reading genuine target-PC sensors, persisting data beside the executable, and shutting down cleanly.
 
@@ -340,4 +352,4 @@ Thermal Watch bundles **LibreHardwareMonitor 0.9.6** (`LibreHardwareMonitor.exe`
 - Bundled license texts: [`third_party/licenses/`](third_party/licenses/)
 - Upstream license material: <https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/tree/v0.9.6/Licenses>
 
-The Thermal Watch Windows package (v1.0.0 onward, including v1.1.0) includes the applicable bundled third-party notices and license texts under `third_party/`, installed beside the application. Those notices apply only to the identified third-party components and do not grant rights to the Thermal Watch source itself. The v1.1.0 AI provider integration (`ai/`) uses only the Python standard library and introduces no new third-party dependency or license obligation.
+The Thermal Watch Windows package (v1.0.0 onward, including v1.1.1) includes the applicable bundled third-party notices and license texts under `third_party/`, installed beside the application. Those notices apply only to the identified third-party components and do not grant rights to the Thermal Watch source itself. The v1.1.1 AI provider integration (`ai/`) uses only the Python standard library and introduces no new third-party dependency or license obligation.

@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from app import cpu_times, memory, nvidia_stats, lhm_sensors, THRESH_CPU, TJMAX  # noqa: E402
+from app import cpu_times, memory, nvidia_stats, lhm_sensors, CPU_YELLOW, TJMAX  # noqa: E402
 
 
 def burn(stop_at: float) -> None:
@@ -95,9 +95,9 @@ def main():
     print("\n--- summary ---")
     if temps:
         print(f"CPU temp: peak {max(temps):.1f}°C, avg {sum(temps)/len(temps):.1f}°C, "
-              f"min {min(temps):.1f}°C  (threshold {THRESH_CPU:.0f}°C, Tjmax {TJMAX:.0f}°C)")
-        over = max(temps) >= THRESH_CPU
-        print(f"Held under threshold: {'NO - exceeded ' + str(THRESH_CPU) + ' deg C' if over else 'YES'}")
+              f"min {min(temps):.1f}°C  (YELLOW zone at {CPU_YELLOW:.0f}°C, Tjmax {TJMAX:.0f}°C)")
+        over = max(temps) >= CPU_YELLOW
+        print(f"Held under YELLOW zone: {'NO - exceeded ' + str(CPU_YELLOW) + ' deg C' if over else 'YES'}")
     else:
         print("CPU temp: no sensor data (bridge not elevated / not running)")
     if loads:

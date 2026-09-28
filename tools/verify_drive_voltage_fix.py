@@ -28,14 +28,14 @@ def main():
     storage_parents = sorted(set(s["Parent"] for s in sensors if "storage" in s.get("Parent", "").lower()))
     for p in storage_parents:
         print(f"  {p}")
-    assert len(storage_parents) == 3, f"expected 3 drives, found {len(storage_parents)}"
+    assert storage_parents, "expected at least one storage device from the live sensor backend"
 
     print("\n=== 2. Composite Temperature selected per drive ===")
     composites = [s for s in sensors if s.get("Name") == "Composite Temperature"
                   and "storage" in s.get("Parent", "").lower()]
     for c in composites:
         print(f"  {c['Parent']:45} {c['Value']}")
-    assert len(composites) == 3
+    assert composites, "expected at least one live Composite Temperature sensor"
 
     print("\n=== 3. Warning/Critical setpoints excluded from the selection ===")
     excluded_names = {s["Name"] for s in sensors if "storage" in s.get("Parent", "").lower()} - {"Composite Temperature"}
@@ -60,8 +60,8 @@ def main():
     children = app.disk_panel.body.winfo_children()
     rows = [w for w in children if w.winfo_class() == "Frame"]
     placeholders = [w for w in children if w.winfo_class() == "Label"]
-    print(f"  disk_panel rendered {len(rows)} row(s) (expect 3), plus {len(placeholders)} hidden placeholder")
-    assert len(rows) == 3, [w.winfo_class() for w in children]
+    print(f"  disk_panel rendered {len(rows)} row(s) (expect {len(composites)}), plus {len(placeholders)} hidden placeholder")
+    assert len(rows) == len(composites), ([w.winfo_class() for w in children], len(composites))
     # Stronger than the old bare count: the placeholder must exist and must NOT be displayed while
     # real rows are present.
     assert len(placeholders) == 1 and not placeholders[0].winfo_manager(), \

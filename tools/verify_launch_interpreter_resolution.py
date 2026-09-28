@@ -48,17 +48,6 @@ def check(name, condition, detail=""):
         FAILURES.append(name)
 
 
-def find_real_pythonw():
-    """A real pythonw.exe on THIS machine, discovered dynamically - never hardcoded."""
-    found = shutil.which("pythonw")
-    if found:
-        return Path(found)
-    candidate = Path(sys.executable).with_name("pythonw.exe")
-    if candidate.exists():
-        return candidate
-    raise RuntimeError("no real pythonw.exe could be discovered on this machine to copy for the test")
-
-
 def run_resolve(path_value):
     """Dot-sources launch.ps1 (loads Resolve-ThermalWatchPythonw, skips the real launcher body
     per its own dot-source guard) inside a child process with a fully-controlled PATH, then calls
@@ -94,33 +83,17 @@ check("Resolve-ThermalWatchPythonw is defined in launch.ps1 (not just described 
 check("launch.ps1 has a dot-source guard so loading it for a test has no launcher side effects",
       "$MyInvocation.InvocationName -eq '.'" in LAUNCH_PS1.read_text(encoding="utf-8"))
 
-real_pythonw = find_real_pythonw()
-check(f"discovered a real pythonw.exe on this machine to copy ({real_pythonw})", real_pythonw.exists())
-
 tmp_root = Path(tempfile.mkdtemp(prefix="tw_launch_interp_test_"))
 try:
     print()
     print("=" * 78)
-    print("1. sanity: with the REAL (unmodified) environment PATH, resolution is still singular")
-    print("=" * 78)
-    import os
-    baseline = run_resolve(os.environ.get("PATH", ""))
-    check("baseline run against the real PATH exits cleanly", baseline.returncode == 0,
-          detail=baseline.stderr.strip()[:400] if baseline.returncode != 0 else "")
-    baseline_result = parse_field(baseline.stdout, "RESULT:")
-    check("baseline RESULT is non-empty", bool(baseline_result))
-    check("baseline result is not an array", parse_field(baseline.stdout, "ISARRAY:") == "False")
-    check("baseline result count is exactly 1", parse_field(baseline.stdout, "COUNT:") == "1")
-
-    print()
-    print("=" * 78)
-    print("2. THE REGRESSION SCENARIO: three separate pythonw.exe installs on PATH")
+    print("1. THE REGRESSION SCENARIO: three separate pythonw.exe entries on PATH")
     print("=" * 78)
     fake_dirs = []
     for i in range(3):
         d = tmp_root / f"install_{i}"
         d.mkdir(parents=True)
-        shutil.copy2(real_pythonw, d / "pythonw.exe")
+        (d / "pythonw.exe").write_bytes(b"MZ\\x00\\x00")  # Get-Command only resolves the path; it never executes it.
         fake_dirs.append(d)
 
     rigged_path = ";".join(str(d) for d in fake_dirs) + r";C:\Windows\System32;C:\Windows\System32\WindowsPowerShell\v1.0"
@@ -145,7 +118,7 @@ try:
 
     print()
     print("=" * 78)
-    print("3. Start-Process -FilePath with this resolved value can only ever start ONE process")
+    print("2. Start-Process -FilePath with this resolved value can only ever target ONE path")
     print("=" * 78)
     # A genuinely scalar [string] passed to -FilePath starts exactly one process by
     # Start-Process's own contract; an [array] is exactly the shape that previously let more

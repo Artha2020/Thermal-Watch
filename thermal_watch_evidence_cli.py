@@ -15,16 +15,28 @@ from pathlib import Path
 EVIDENCE_SNAPSHOT_PATH = Path(__file__).resolve().parent / "thermal_watch_evidence.json"
 ADAPTER_VERSION = "1.0"
 MAX_LIMIT = 100
+# Matches app.py's real INCIDENT_RETENTION_DAYS/SESSION_RETENTION_DAYS - the actual maximum
+# history Thermal Watch still has on disk. A wider max would silently promise data that was
+# already pruned.
+MAX_DAYS = 30
 TOOL_CATALOG_VERSION = 1
 TOOL_CATALOG_SCHEMA = "thermal-watch-tool-catalog"
 
 
-def _parameters(*, limit=False):
+def _parameters(*, limit=False, days=False):
     properties = {}
     if limit:
         properties["limit"] = {
             "type": "integer", "minimum": 1, "maximum": MAX_LIMIT,
             "description": "Maximum number of newest records to return.",
+        }
+    if days:
+        properties["days"] = {
+            "type": "integer", "minimum": 1, "maximum": MAX_DAYS,
+            "description": "How many days of history to include, ending now. Omit or 1 for the "
+                            "default last-24h snapshot; up to " + str(MAX_DAYS) +
+                            " reaches further back into Thermal Watch's retained history "
+                            "(only available over the live pipe, not the on-disk snapshot file).",
         }
     return {"type": "object", "properties": properties, "required": [], "additionalProperties": False}
 
@@ -96,14 +108,14 @@ OPERATIONS = {
     },
     "get_recent_incidents": {
         "description": "Return recent persisted Thermal Watch incident evidence.",
-        "parameters": _parameters(limit=True),
+        "parameters": _parameters(limit=True, days=True),
         "response": _evidence_response("array", "Recent incident records plus monitoring-coverage limits."),
         "read_only": True,
         "capability_requirement": "a readable snapshot containing the recent-incident collection",
     },
     "get_recent_sessions": {
         "description": "Return recent persisted Thermal Watch workload-session evidence.",
-        "parameters": _parameters(limit=True),
+        "parameters": _parameters(limit=True, days=True),
         "response": _evidence_response("array", "Recent workload-session records plus monitoring-coverage limits."),
         "read_only": True,
         "capability_requirement": "a readable snapshot containing the recent-session collection",
@@ -114,6 +126,29 @@ OPERATIONS = {
         "response": _evidence_response("object", "Coverage evidence and the boundary on unmonitored time."),
         "read_only": True,
         "capability_requirement": "a readable snapshot containing monitoring-coverage evidence",
+    },
+    "get_experiments": {
+        "description": "Return persisted hardware-change experiment markers (e.g. 'installed new "
+                        "fans'), or - given experiment_id - a full before/after comparison report "
+                        "for one marker. Call with no experiment_id first to discover valid ids.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "experiment_id": {
+                    "type": "string",
+                    "description": "Return the full before/after report for this one marker "
+                                    "instead of the marker list. Get valid ids from a call with "
+                                    "no experiment_id first.",
+                },
+            },
+            "required": [], "additionalProperties": False,
+        },
+        "response": _evidence_response(
+            "object", "Either the marker list or one marker's full before/after report - a "
+                       "report always carries a non-causal caveat, even when it shows a real "
+                       "measured change."),
+        "read_only": True,
+        "capability_requirement": "only available over the live Thermal Watch pipe, not the on-disk snapshot file",
     },
 }
 
@@ -260,11 +295,18 @@ def _operation_availability(snapshot, load_error):
             "available" if isinstance(snapshot.get("coverage_24h"), dict) else "unavailable",
             isinstance(snapshot.get("coverage_24h"), dict),
             "coverage evidence present" if isinstance(snapshot.get("coverage_24h"), dict) else "coverage evidence unavailable"),
+        # Experiment markers/reports aren't embedded in the snapshot at all (unlike incidents/
+        # sessions, which at least carry a 24h subset) - there's no snapshot signal to gate on
+        # either way, so this reports "available" whenever a snapshot loads; the file-based CLI
+        # transport (no experiments_fetcher, ever) degrades honestly at dispatch time instead,
+        # same pattern as get_recent_incidents/get_recent_sessions with days>1.
+        "get_experiments": _availability(
+            "available", True, "marker discovery is available; a live pipe connection is needed for a full report"),
     }
 
 
-def describe_operation_catalog():
-    snapshot, load_error = _load_snapshot()
+def describe_operation_catalog(loader=_load_snapshot):
+    snapshot, load_error = loader()
     availability = _operation_availability(snapshot, load_error)
     operations = {}
     for name, definition in OPERATIONS.items():
@@ -334,14 +376,103 @@ def _compact_session(record):
     return fields
 
 
-def handle_request(request):
+def _recent_records(operation, snapshot, coverage, parameters, component, snapshot_key, compact_fn, history_fetcher):
+    """Shared dispatch for get_recent_incidents/get_recent_sessions. days<=1 (the default) is
+    served from the already-embedded 24h snapshot field exactly as before - byte-for-byte
+    unchanged behavior. days>1 needs data the snapshot doesn't carry, so it's only honored when
+    a history_fetcher was supplied (the in-process pipe path); otherwise it degrades honestly
+    (evidence_unavailable) rather than silently answering from the narrower 24h window."""
+    days = parameters.get("days", 1)
+    limit = parameters.get("limit", 25)
+    scope_label = "recorded " + component + " only"
+    if days > 1:
+        if history_fetcher is None:
+            return _error("history_unavailable",
+                           "history beyond the last 24h is only available over the live Thermal "
+                           "Watch pipe, not this snapshot file")
+        rows, wide_coverage, fetch_error = history_fetcher(component, days)
+        if fetch_error:
+            return fetch_error
+        result = _response(operation, snapshot, [compact_fn(r) for r in rows[:limit]],
+                            _coverage_status(wide_coverage), wide_coverage)
+        result["data_scope"] = (scope_label + ", over the requested " + str(days) + "-day window; "
+                                 "no record can establish what happened outside monitored time")
+        return result
+    rows = list(snapshot.get(snapshot_key) or [])[:limit]
+    result = _response(operation, snapshot, [compact_fn(r) for r in rows], _coverage_status(coverage), coverage)
+    result["data_scope"] = scope_label + "; no record can establish what happened outside monitored time"
+    return result
+
+
+def _compact_experiment_marker(record):
+    return _select_fields(record, ("experiment_id", "created_timestamp", "change_timestamp",
+                                    "description", "component"))
+
+
+def _compact_experiment_report(report):
+    fields = _select_fields(report, (
+        "experiment", "component_label", "bounds", "insufficient_reason", "workload_trends",
+        "idle", "health_score", "confounds", "direction", "confidence", "primary_source",
+        "primary", "caveat",
+    ))
+    if isinstance(fields.get("experiment"), dict):
+        fields["experiment"] = _compact_experiment_marker(fields["experiment"])
+    return fields
+
+
+def _experiments_response(operation, snapshot, parameters, experiments_fetcher):
+    """get_experiments dispatch. Unlike every other operation, this one has NOTHING in the
+    snapshot to fall back to (experiment markers/reports were never embedded in it) - it is
+    pipe-only from the start, not "pipe-only above a 1-day default" like get_recent_incidents/
+    get_recent_sessions. experiments_fetcher: (experiment_id_or_None) -> (result, error_dict);
+    result is the raw marker list when experiment_id is None, or one compute_experiment_report()
+    dict (already carrying its EXPERIMENT_CAVEAT text - added by the fetcher, which is the one
+    side of this split that actually knows that constant) when experiment_id names a real marker.
+    """
+    if experiments_fetcher is None:
+        return _error("history_unavailable",
+                       "experiment markers and reports are only available over the live Thermal "
+                       "Watch pipe, not this snapshot file")
+    experiment_id = parameters.get("experiment_id")
+    result, fetch_error = experiments_fetcher(experiment_id)
+    if fetch_error:
+        return fetch_error
+    if experiment_id is None:
+        markers = [_compact_experiment_marker(m) for m in result]
+        response = _response(operation, snapshot, {"markers": markers},
+                              "observed" if markers else "unavailable")
+        response["data_scope"] = ("experiment markers only; call again with experiment_id from "
+                                   "this list for a full before/after report")
+        return response
+    data = _compact_experiment_report(result)
+    status = "unavailable" if data.get("bounds") is None or data.get("direction") is None else "derived"
+    response = _response(operation, snapshot, data, status)
+    response["data_scope"] = ("a computed before/after comparison for one marked change; "
+                               "correlation with the marked change is not proof of causation")
+    return response
+
+
+def handle_request(request, loader=_load_snapshot, history_fetcher=None, experiments_fetcher=None):
+    """loader: () -> (snapshot_dict_or_None, error_dict_or_None), matching _load_snapshot()'s
+    contract. Defaults to the on-disk snapshot (this CLI's normal behavior); the in-process
+    named-pipe server (thermal_watch_evidence_pipe.py, wired up in app.py) passes a loader that
+    reads a live cached snapshot instead, with zero duplication of validation/dispatch/formatting.
+
+    history_fetcher: optional (component, days) -> (rows, coverage_dict_or_None, error_dict_or_None).
+    component is "incidents" or "sessions". Used only by get_recent_incidents/get_recent_sessions
+    when `days` > 1 is requested - see _recent_records(). Only the pipe path supplies this, since
+    only it can read Thermal Watch's full retained history directly.
+
+    experiments_fetcher: optional (experiment_id_or_None) -> (result, error_dict_or_None), used
+    only by get_experiments - see _experiments_response(). Only the pipe path supplies this.
+    """
     operation, parameters, validation_error = _validate_request(request)
     if validation_error:
         return validation_error
     if operation == "describe_operations":
-        return describe_operation_catalog()
+        return describe_operation_catalog(loader)
 
-    snapshot, load_error = _load_snapshot()
+    snapshot, load_error = loader()
     if load_error:
         return load_error
     coverage = snapshot.get("coverage_24h") or {}
@@ -375,17 +506,13 @@ def handle_request(request):
         status = "observed" if rows else ("unavailable" if not network.get("per_process_capture_active") else "observed")
         return _response(operation, snapshot, rows, status)
     if operation == "get_recent_incidents":
-        rows = [_compact_incident(row) for row in
-                list(snapshot.get("recent_incidents_24h") or [])[: parameters.get("limit", 25)]]
-        result = _response(operation, snapshot, rows, _coverage_status(coverage), coverage)
-        result["data_scope"] = "recorded incidents only; no record can establish what happened outside monitored time"
-        return result
+        return _recent_records(operation, snapshot, coverage, parameters, "incidents",
+                                "recent_incidents_24h", _compact_incident, history_fetcher)
     if operation == "get_recent_sessions":
-        rows = [_compact_session(row) for row in
-                list(snapshot.get("recent_sessions_24h") or [])[: parameters.get("limit", 25)]]
-        result = _response(operation, snapshot, rows, _coverage_status(coverage), coverage)
-        result["data_scope"] = "recorded sessions only; no record can establish what happened outside monitored time"
-        return result
+        return _recent_records(operation, snapshot, coverage, parameters, "sessions",
+                                "recent_sessions_24h", _compact_session, history_fetcher)
+    if operation == "get_experiments":
+        return _experiments_response(operation, snapshot, parameters, experiments_fetcher)
     return _response(operation, snapshot, coverage, _coverage_status(coverage), coverage)
 
 

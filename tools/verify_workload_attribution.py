@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import _verify_sandbox  # noqa: E402,F401  - MUST precede `import app`: redirects every store to a temp dir
-from app import App, EVENT_LOG_PATH, _sample_process_cpu_times, cpu_top_processes  # noqa: E402
+from app import App, EVENT_LOG_PATH, _sample_process_stats, cpu_top_processes  # noqa: E402
 
 
 def main():
@@ -22,9 +22,9 @@ def main():
                              "import time; x=0.0001\nt=time.time()+3\n"
                              "while time.time()<t: x=x*1.0000001+0.0000001"])
     time.sleep(0.3)  # let it start and register
-    t1 = _sample_process_cpu_times()
+    t1 = _sample_process_stats()
     time.sleep(2.0)
-    t2 = _sample_process_cpu_times()
+    t2 = _sample_process_stats()
     top = cpu_top_processes(t1, t2, 2.0)
     proc.wait()
     names = [n for n, p, pct in top]
