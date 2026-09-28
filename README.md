@@ -317,11 +317,11 @@ Telemetry, incidents, sessions, and event history use a 30-day retention window.
 
 ## Verification and testing
 
-The repository contains 51 feature verification scripts plus `tools/verify_isolation.py`, which runs the complete verification set (52 scripts total) in redirected temporary data directories and compares production files byte-for-byte before and after the run.
+The repository contains 52 feature verification scripts plus `tools/verify_isolation.py`, for 53 verification scripts total. The isolation gate runs the complete 52-script feature set in redirected temporary data directories and compares production files byte-for-byte before and after the run.
 
 The v1.1.1 release pass reported:
 
-- 51/51 feature verification scripts passing, including the Network Intelligence and AI provider/settings/grounding suites added since v1.0.1.
+- 52/52 feature verification scripts passing, including the Network Intelligence and AI provider/settings/grounding suites added since v1.0.1.
 - Verification isolation passing with production data unchanged.
 - The packaged executable launching without a console window, reading genuine target-PC sensors, persisting data beside the executable, and shutting down cleanly.
 
