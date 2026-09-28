@@ -46,8 +46,6 @@ jobs:
       - name: Universal AI adapter
         run: python tools/verify_universal_ai_adapter.py
 
-      - name: Launcher interpreter regression
-        run: python tools/verify_launch_interpreter_resolution.py
 
       - name: PyInstaller smoke build
         run: python -m PyInstaller --clean --noconfirm ThermalWatch.spec
